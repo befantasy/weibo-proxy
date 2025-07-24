@@ -254,11 +254,17 @@ async function getQRCode() {
 // 检查扫码状态
 async function checkScanStatus() {
     try {
-        // CHANGE: 检查 loginPage 而不是全局 page
-        if (!loginPage || loginPage.isClosed()) {
-            return { status: 'error', message: '登录页面已关闭，请刷新二维码' };
+        // 先判断是否已登录
+        if (isLoggedIn) {
+            return { status: 'success', message: '登录成功（已缓存）' };
         }
-        
+
+        // 
+        if (!loginPage || loginPage.isClosed()) {
+            return { status: 'waiting', message: '页面已关闭，正在确认登录状态...' };
+        }
+
+        // 以下逻辑保持不变
         await loginPage.waitForLoadState('domcontentloaded', { timeout: 5000 }).catch(() => {});
         const currentUrl = loginPage.url();
         logWithFlush('[扫码状态] 当前页面URL:', currentUrl);
@@ -267,7 +273,6 @@ async function checkScanStatus() {
             isLoggedIn = true;
             await saveSession();
             logWithFlush('[扫码状态] ✅ 用户扫码登录成功！');
-            // CHANGE: 登录成功后，立即关闭页面释放资源
             await loginPage.close();
             loginPage = null;
             return { status: 'success', message: '登录成功' };
@@ -283,7 +288,6 @@ async function checkScanStatus() {
         const expiredElement = await loginPage.$('text=二维码已失效').catch(() => null);
         if (expiredElement) {
             logWithFlush('[扫码状态] ⏰ 二维码已过期');
-            // CHANGE: 二维码过期后，关闭页面释放资源
             await loginPage.close();
             loginPage = null;
             return { status: 'error', message: '二维码已过期，请刷新' };
@@ -305,7 +309,6 @@ async function checkScanStatus() {
         return { status: 'waiting', message: statusMessage };
     } catch (error) {
         logErrorWithFlush('[扫码状态] 检查扫码状态失败:', error.message);
-        // CHANGE: 出现任何错误都尝试关闭页面
         if (loginPage && !loginPage.isClosed()) {
             await loginPage.close();
             loginPage = null;
@@ -313,6 +316,7 @@ async function checkScanStatus() {
         return { status: 'error', message: '检查状态失败: ' + error.message };
     }
 }
+
 
 // 改进的发送微博功能
 async function postWeibo(content) {
