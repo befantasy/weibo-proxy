@@ -345,7 +345,7 @@ async function postWeibo(content) {
 
             logWithFlush('[发送微博] 点击发送按钮并等待响应...');
             const [response] = await Promise.all([
-                page.waitForResponse(res => res.url().includes('/ajax/statuses/update') && res.status() === 200, { timeout: 20000 }),
+                page.waitForResponse(res => res.url().includes('/ajax/statuses/update') && res.status() === 200, { timeout: 15000 }),
                 page.click('button:has-text("发送")'),
             ]);
 
