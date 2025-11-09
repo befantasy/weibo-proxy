@@ -7,12 +7,12 @@ services:
       - "3000:3000"
     volumes:
       - ./data:/app/data
-      # 不再需要/dev/shm映射，Playwright官方镜像已经优化
     environment:
       - NODE_ENV=production
       - PORT=3000
-      - NODE_OPTIONS=--max-old-space-size=512
-      # Playwright环境变量
+      - NODE_OPTIONS=--max-old-space-size=512 --expose-gc
+      - NODE_GC_INTERVAL=30000
+      # Playwright 环境变量
       - PLAYWRIGHT_BROWSERS_PATH=/ms-playwright
     restart: unless-stopped
     mem_limit: 512m
@@ -23,4 +23,4 @@ services:
       interval: 60s
       timeout: 10s
       retries: 3
-      start_period: 10s
+      start_period: 30s
