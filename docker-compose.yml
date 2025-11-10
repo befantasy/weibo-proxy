@@ -10,17 +10,25 @@ services:
     environment:
       - NODE_ENV=production
       - PORT=3000
-      - NODE_OPTIONS=--max-old-space-size=512 --expose-gc
-      - NODE_GC_INTERVAL=30000
-      # Playwright 环境变量
+      # 优化内存设置
+      - NODE_OPTIONS=--max-old-space-size=384 --expose-gc
       - PLAYWRIGHT_BROWSERS_PATH=/ms-playwright
+      # 新增：禁用一些 Chromium 功能以节省内存
+      - PLAYWRIGHT_CHROMIUM_USE_HEADLESS_NEW=1
     restart: unless-stopped
-    mem_limit: 512m
-    memswap_limit: 512m
+    # 放宽内存限制（Render 免费账户是 512MB）
+    mem_limit: 480m
+    memswap_limit: 480m
+    # 添加内存预留，确保基础运行
+    mem_reservation: 256m
 
     healthcheck:
       test: ["CMD", "curl", "-f", "http://localhost:3000/health"]
-      interval: 60s
-      timeout: 10s
+      interval: 120s  # 增加间隔，减少资源消耗
+      timeout: 15s
       retries: 3
-      start_period: 30s
+      start_period: 40s
+    
+    # 新增：OOM 处理
+    oom_kill_disable: false
+    oom_score_adj: 0
