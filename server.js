@@ -62,7 +62,7 @@ let loginPage = null;
 let isLoggedIn = false;
 let lastActivityTime = Date.now();
 
-// 🔥 优化的浏览器资源管理器
+// 🔥 优化的浏览器资源管理器 - 关键操作后立即保存会话
 class BrowserManager {
     constructor() {
         this.browser = null;
@@ -109,7 +109,7 @@ class BrowserManager {
 
         this.updateActivity();
         this.startCleanupTimer();
-        this.startAutoSave(); // 🔥 启动自动保存
+        this.startAutoSave();
         return { browser: this.browser, context: this.context };
     }
 
@@ -117,20 +117,10 @@ class BrowserManager {
         this.lastActivity = Date.now();
     }
 
-    // 🔥 新增：在清理前先保存会话
-    async cleanupWithSave() {
-        if (this.context && isLoggedIn) {
-            logWithFlush('[清理] 保存会话后再关闭上下文...');
-            try {
-                const sessionData = await this.context.storageState();
-                await fs.writeJson(SESSION_FILE, sessionData);
-                logWithFlush('[清理] 会话已保存');
-            } catch (error) {
-                logErrorWithFlush('[清理] 保存会话失败:', error.message);
-            }
-        }
-        
+    // 🔥 清理时不再尝试保存会话
+    async cleanupContext() {
         if (this.context) {
+            logWithFlush('[清理] 关闭浏览器上下文（会话已在之前保存）...');
             await this.context.close().catch(() => {});
             this.context = null;
             logWithFlush('[清理] 浏览器上下文已关闭');
@@ -143,18 +133,16 @@ class BrowserManager {
         this.cleanupInterval = setInterval(async () => {
             const idleTime = Date.now() - this.lastActivity;
             if (idleTime > this.idleTimeout && this.context) {
-                logWithFlush('[清理] 检测到长时间无活动，准备关闭浏览器上下文');
-                await this.cleanupWithSave(); // 🔥 使用新的清理方法
+                logWithFlush('[清理] 检测到长时间无活动，关闭浏览器上下文以节省资源');
+                await this.cleanupContext();
             }
-        }, 60000); // 每分钟检查一次
+        }, 60000);
     }
 
-    // 🔥 新增：自动保存定时器（只在上下文存在时保存）
     startAutoSave() {
         if (this.autoSaveInterval) return;
         
         this.autoSaveInterval = setInterval(async () => {
-            // 🔥 关键修复：检查上下文是否存在且有效
             if (this.context && isLoggedIn) {
                 try {
                     logWithFlush('[定期保存] 自动保存登录会话...');
@@ -162,7 +150,6 @@ class BrowserManager {
                     await fs.writeJson(SESSION_FILE, sessionData);
                     logWithFlush('[定期保存] 会话保存成功');
                 } catch (error) {
-                    // 如果上下文已关闭，仅记录一次警告
                     if (error.message.includes('closed')) {
                         logWithFlush('[定期保存] 上下文已关闭，跳过本次保存');
                     } else {
@@ -172,11 +159,10 @@ class BrowserManager {
             } else {
                 logWithFlush('[定期保存] 无活动会话，跳过保存');
             }
-        }, 5 * 60 * 1000); // 每5分钟
+        }, 3 * 60 * 1000); // 🔥 缩短为3分钟，更频繁保存
     }
 
     async cleanup(closeBrowser = true) {
-        // 🔥 先清理定时器
         if (this.cleanupInterval) {
             clearInterval(this.cleanupInterval);
             this.cleanupInterval = null;
@@ -186,8 +172,7 @@ class BrowserManager {
             this.autoSaveInterval = null;
         }
 
-        // 🔥 再清理浏览器资源
-        await this.cleanupWithSave();
+        await this.cleanupContext();
         
         if (closeBrowser && this.browser) {
             await this.browser.close().catch(() => {});
@@ -196,16 +181,18 @@ class BrowserManager {
         }
     }
 
-    // 🔥 新增：手动保存会话的方法
-    async saveSession() {
+    // 🔥 立即保存会话（在关键操作后调用）
+    async saveSessionNow() {
         if (this.context && isLoggedIn) {
             try {
                 const sessionData = await this.context.storageState();
                 await fs.writeJson(SESSION_FILE, sessionData);
-                logWithFlush('[会话] 会话已保存');
+                logWithFlush('[会话] 会话已立即保存');
                 return true;
             } catch (error) {
-                logErrorWithFlush('[会话] 保存会话失败:', error.message);
+                if (!error.message.includes('closed')) {
+                    logErrorWithFlush('[会话] 立即保存失败:', error.message);
+                }
                 return false;
             }
         }
@@ -219,11 +206,6 @@ async function initBrowser() {
     const { browser: br, context: ctx } = await browserManager.init();
     browser = br;
     context = ctx;
-}
-
-// 🔥 简化的 saveSession，委托给 BrowserManager
-async function saveSession() {
-    return await browserManager.saveSession();
 }
 
 async function loadSession() {
@@ -258,6 +240,10 @@ async function checkLoginStatus() {
                 isLoggedIn = true;
                 lastActivityTime = Date.now();
                 logWithFlush('[登录检查] ✅ 用户已登录');
+                
+                // 🔥 登录状态确认后立即保存会话
+                await browserManager.saveSessionNow();
+                
                 return true;
             } catch {
                 isLoggedIn = false;
@@ -338,8 +324,11 @@ async function checkScanStatus() {
         if (currentUrl.includes('weibo.com') && !currentUrl.includes('passport')) {
             isLoggedIn = true;
             lastActivityTime = Date.now();
-            await saveSession(); // 🔥 登录成功立即保存
+            
+            // 🔥 登录成功后立即保存会话
             logWithFlush('[扫码状态] ✅ 用户扫码登录成功！');
+            await browserManager.saveSessionNow();
+            
             await loginPage.close();
             loginPage = null;
             return { status: 'success', message: '登录成功' };
@@ -406,6 +395,10 @@ async function postWeibo(content) {
             if (result.ok === 1) {
                 lastActivityTime = Date.now();
                 logWithFlush('[发送微博] ✅ 微博发送成功!');
+                
+                // 🔥 关键：发送成功后立即保存会话
+                await browserManager.saveSessionNow();
+                
                 return {
                     success: true, message: '微博发送成功',
                     weiboId: result.data?.idstr, content: result.data?.text_raw || content,
@@ -519,20 +512,17 @@ app.use((err, req, res, next) => {
     res.status(500).json({ error: '服务器内部错误' });
 });
 
-// 🔥 优化的关闭处理
+// 🔥 优化的关闭处理：不再尝试保存会话
 async function gracefulShutdown(signal) {
     logWithFlush(`[关闭] 收到 ${signal} 信号，正在优雅关闭...`);
+    logWithFlush(`[关闭] 会话已在之前的操作中保存，无需再次保存`);
+    
     try {
-        // 🔥 关键：先保存会话
-        if (isLoggedIn && context) {
-            logWithFlush('[关闭] 保存登录会话...');
-            await saveSession();
-        }
-        
+        // 🔥 直接清理资源，不尝试保存会话
         await browserManager.cleanup(true);
         logWithFlush('[关闭] 资源清理完成');
     } catch (error) {
-        logErrorWithFlush('[关闭] 清理资源时出错:', error);
+        logErrorWithFlush('[关闭] 清理资源时出错:', error.message);
     }
     process.exit(0);
 }
@@ -548,4 +538,5 @@ app.listen(PORT, () => {
     logWithFlush(`[启动] 🚀 服务器运行在端口 ${PORT}`);
     logWithFlush(`[启动] 🌐 访问地址: http://localhost:${PORT}`);
     logWithFlush(`[启动] ❤️ 健康检查: http://localhost:${PORT}/health`);
+    logWithFlush(`[启动] 💾 会话策略：关键操作后立即保存，SIGTERM 时使用已保存的会话`);
 });
