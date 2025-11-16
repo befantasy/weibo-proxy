@@ -11,14 +11,15 @@ services:
       - NODE_ENV=production
       - PORT=3000
       # 优化内存设置
-      - NODE_OPTIONS=--max-old-space-size=384 --expose-gc
+      - NODE_OPTIONS=--max-old-space-size=256 --expose-gc
       - PLAYWRIGHT_BROWSERS_PATH=/ms-playwright
       # 新增：禁用一些 Chromium 功能以节省内存
       - PLAYWRIGHT_CHROMIUM_USE_HEADLESS_NEW=1
+      - PLAYWRIGHT_CHROMIUM_ARGS=--disable-gpu --no-sandbox --disable-dev-shm-usage
     restart: unless-stopped
     # 放宽内存限制（Render 免费账户是 512MB）
-    mem_limit: 480m
-    memswap_limit: 480m
+    mem_limit: 450m
+    memswap_limit: 450m
     # 添加内存预留，确保基础运行
     mem_reservation: 256m
 
