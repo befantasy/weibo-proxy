@@ -18,6 +18,228 @@ function logErrorWithFlush(...args) {
     if (process.stderr.write) process.stderr.write('');
 }
 
+// ========================= 请求队列管理器 =========================
+class RequestQueue {
+    constructor() {
+        this.queue = [];
+        this.processing = false;
+        this.currentOperation = null;
+    }
+
+    async enqueue(operation, operationName = 'unknown') {
+        return new Promise((resolve, reject) => {
+            const task = {
+                operation,
+                operationName,
+                resolve,
+                reject,
+                timestamp: Date.now()
+            };
+            
+            this.queue.push(task);
+            logWithFlush(`[队列] 任务入队: ${operationName} (队列长度: ${this.queue.length})`);
+            
+            this.processQueue();
+        });
+    }
+
+    async processQueue() {
+        if (this.processing || this.queue.length === 0) {
+            return;
+        }
+
+        this.processing = true;
+        const task = this.queue.shift();
+        this.currentOperation = task.operationName;
+
+        try {
+            logWithFlush(`[队列] 开始执行: ${task.operationName} (等待时间: ${Date.now() - task.timestamp}ms)`);
+            const result = await task.operation();
+            task.resolve(result);
+            logWithFlush(`[队列] 执行成功: ${task.operationName}`);
+        } catch (error) {
+            logErrorWithFlush(`[队列] 执行失败: ${task.operationName}`, error.message);
+            task.reject(error);
+        } finally {
+            this.currentOperation = null;
+            this.processing = false;
+            
+            if (this.queue.length > 0) {
+                logWithFlush(`[队列] 继续处理队列 (剩余: ${this.queue.length})`);
+                setImmediate(() => this.processQueue());
+            }
+        }
+    }
+
+    getStatus() {
+        return {
+            queueLength: this.queue.length,
+            processing: this.processing,
+            currentOperation: this.currentOperation
+        };
+    }
+}
+
+const requestQueue = new RequestQueue();
+
+// ========================= 浏览器资源管理器 =========================
+class BrowserManager {
+    constructor() {
+        this.browser = null;
+        this.context = null;
+        this.lastActivity = Date.now();
+        this.idleTimeout = 10 * 60 * 1000;
+        this.cleanupInterval = null;
+        this.autoSaveInterval = null;
+        this.isInitializing = false; // 防止重复初始化
+    }
+
+    async init() {
+        // 防止并发初始化
+        if (this.isInitializing) {
+            logWithFlush('[浏览器] 正在初始化中，等待完成...');
+            while (this.isInitializing) {
+                await new Promise(resolve => setTimeout(resolve, 100));
+            }
+            return { browser: this.browser, context: this.context };
+        }
+
+        if (this.browser && this.context) {
+            this.updateActivity();
+            return { browser: this.browser, context: this.context };
+        }
+
+        this.isInitializing = true;
+        try {
+            if (!this.browser) {
+                logWithFlush('[浏览器] 启动浏览器...');
+                this.browser = await chromium.launch({
+                    headless: true,
+                    args: [
+                        '--no-sandbox', '--disable-setuid-sandbox', '--disable-dev-shm-usage',
+                        '--disable-web-security', '--disable-gpu', '--disable-extensions',
+                        '--disable-background-timer-throttling',
+                        '--disable-backgrounding-occluded-windows',
+                        '--disable-renderer-backgrounding',
+                        '--max_old_space_size=256',
+                        '--disable-features=Translate,BackForwardCache,VizDisplayCompositor',
+                    ]
+                });
+            }
+
+            if (this.context && !this.browser.isConnected()) {
+                await this.context.close().catch(() => {});
+                this.context = null;
+            }
+
+            if (!this.context) {
+                logWithFlush('[浏览器] 创建浏览器上下文...');
+                const sessionData = await loadSession();
+                const contextOptions = {
+                    userAgent: 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36'
+                };
+                if (sessionData) {
+                    contextOptions.storageState = sessionData;
+                }
+                this.context = await this.browser.newContext(contextOptions);
+            }
+
+            this.updateActivity();
+            this.startCleanupTimer();
+            this.startAutoSave();
+            
+            return { browser: this.browser, context: this.context };
+        } finally {
+            this.isInitializing = false;
+        }
+    }
+
+    updateActivity() {
+        this.lastActivity = Date.now();
+    }
+
+    async cleanupContext() {
+        if (this.context) {
+            logWithFlush('[清理] 关闭浏览器上下文...');
+            await this.context.close().catch(() => {});
+            this.context = null;
+            logWithFlush('[清理] 浏览器上下文已关闭');
+        }
+    }
+
+    startCleanupTimer() {
+        if (this.cleanupInterval) return;
+        
+        this.cleanupInterval = setInterval(async () => {
+            const idleTime = Date.now() - this.lastActivity;
+            // 如果有任务在处理，不清理
+            if (idleTime > this.idleTimeout && this.context && !requestQueue.processing) {
+                logWithFlush('[清理] 检测到长时间无活动，关闭浏览器上下文');
+                await this.cleanupContext();
+            }
+        }, 60000);
+    }
+
+    startAutoSave() {
+        if (this.autoSaveInterval) return;
+        
+        this.autoSaveInterval = setInterval(async () => {
+            // 只在没有任务处理时保存
+            if (this.context && isLoggedIn && !requestQueue.processing) {
+                try {
+                    logWithFlush('[定期保存] 自动保存登录会话...');
+                    const sessionData = await this.context.storageState();
+                    await fs.writeJson(SESSION_FILE, sessionData);
+                    logWithFlush('[定期保存] 会话保存成功');
+                } catch (error) {
+                    if (!error.message.includes('closed')) {
+                        logErrorWithFlush('[定期保存] 保存失败:', error.message);
+                    }
+                }
+            }
+        }, 3 * 60 * 1000);
+    }
+
+    async cleanup(closeBrowser = true) {
+        if (this.cleanupInterval) {
+            clearInterval(this.cleanupInterval);
+            this.cleanupInterval = null;
+        }
+        if (this.autoSaveInterval) {
+            clearInterval(this.autoSaveInterval);
+            this.autoSaveInterval = null;
+        }
+
+        await this.cleanupContext();
+        
+        if (closeBrowser && this.browser) {
+            await this.browser.close().catch(() => {});
+            this.browser = null;
+            logWithFlush('[清理] 浏览器进程已关闭');
+        }
+    }
+
+    async saveSessionNow() {
+        if (this.context && isLoggedIn) {
+            try {
+                const sessionData = await this.context.storageState();
+                await fs.writeJson(SESSION_FILE, sessionData);
+                logWithFlush('[会话] 会话已立即保存');
+                return true;
+            } catch (error) {
+                if (!error.message.includes('closed')) {
+                    logErrorWithFlush('[会话] 立即保存失败:', error.message);
+                }
+                return false;
+            }
+        }
+        return false;
+    }
+}
+
+const browserManager = new BrowserManager();
+
+// ========================= 应用配置 =========================
 app.use(cors());
 app.use(express.json({ limit: '50kb' }));
 app.use('/api', (req, res, next) => {
@@ -28,14 +250,8 @@ app.use('/api', (req, res, next) => {
 });
 
 app.use('/api', (req, res, next) => {
-    if (req.path === '/post') {
-        logWithFlush('请求方法:', req.method);
-        logWithFlush('请求路径:', req.path);
-        logWithFlush('请求类型:', req.get('Content-Type'));
-        logWithFlush('请求内容:', req.body);
-    } else {
-        logWithFlush('请求路径:', req.path);
-    }
+    const queueStatus = requestQueue.getStatus();
+    logWithFlush(`[请求] ${req.method} ${req.path} (队列: ${queueStatus.queueLength}, 处理中: ${queueStatus.currentOperation || '无'})`);
     next();
 });
 
@@ -62,146 +278,7 @@ let loginPage = null;
 let isLoggedIn = false;
 let lastActivityTime = Date.now();
 
-// 🔥 优化的浏览器资源管理器 - 关键操作后立即保存会话
-class BrowserManager {
-    constructor() {
-        this.browser = null;
-        this.context = null;
-        this.lastActivity = Date.now();
-        this.idleTimeout = 10 * 60 * 1000; // 10分钟无活动则关闭
-        this.cleanupInterval = null;
-        this.autoSaveInterval = null;
-    }
-
-    async init() {
-        if (!this.browser) {
-            logWithFlush('[浏览器] 启动浏览器...');
-            this.browser = await chromium.launch({
-                headless: true,
-                args: [
-                    '--no-sandbox', '--disable-setuid-sandbox', '--disable-dev-shm-usage',
-                    '--disable-web-security', '--disable-gpu', '--disable-extensions',
-                    '--disable-background-timer-throttling',
-                    '--disable-backgrounding-occluded-windows',
-                    '--disable-renderer-backgrounding',
-                    '--max_old_space_size=256',
-                    '--disable-features=Translate,BackForwardCache,VizDisplayCompositor',
-                ]
-            });
-        }
-
-        if (this.context && !this.browser.isConnected()) {
-            await this.context.close().catch(() => {});
-            this.context = null;
-        }
-
-        if (!this.context) {
-            logWithFlush('[浏览器] 创建浏览器上下文...');
-            const sessionData = await loadSession();
-            const contextOptions = {
-                userAgent: 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36'
-            };
-            if (sessionData) {
-                contextOptions.storageState = sessionData;
-            }
-            this.context = await this.browser.newContext(contextOptions);
-        }
-
-        this.updateActivity();
-        this.startCleanupTimer();
-        this.startAutoSave();
-        return { browser: this.browser, context: this.context };
-    }
-
-    updateActivity() {
-        this.lastActivity = Date.now();
-    }
-
-    // 🔥 清理时不再尝试保存会话
-    async cleanupContext() {
-        if (this.context) {
-            logWithFlush('[清理] 关闭浏览器上下文（会话已在之前保存）...');
-            await this.context.close().catch(() => {});
-            this.context = null;
-            logWithFlush('[清理] 浏览器上下文已关闭');
-        }
-    }
-
-    startCleanupTimer() {
-        if (this.cleanupInterval) return;
-        
-        this.cleanupInterval = setInterval(async () => {
-            const idleTime = Date.now() - this.lastActivity;
-            if (idleTime > this.idleTimeout && this.context) {
-                logWithFlush('[清理] 检测到长时间无活动，关闭浏览器上下文以节省资源');
-                await this.cleanupContext();
-            }
-        }, 60000);
-    }
-
-    startAutoSave() {
-        if (this.autoSaveInterval) return;
-        
-        this.autoSaveInterval = setInterval(async () => {
-            if (this.context && isLoggedIn) {
-                try {
-                    logWithFlush('[定期保存] 自动保存登录会话...');
-                    const sessionData = await this.context.storageState();
-                    await fs.writeJson(SESSION_FILE, sessionData);
-                    logWithFlush('[定期保存] 会话保存成功');
-                } catch (error) {
-                    if (error.message.includes('closed')) {
-                        logWithFlush('[定期保存] 上下文已关闭，跳过本次保存');
-                    } else {
-                        logErrorWithFlush('[定期保存] 保存失败:', error.message);
-                    }
-                }
-            } else {
-                logWithFlush('[定期保存] 无活动会话，跳过保存');
-            }
-        }, 3 * 60 * 1000); // 🔥 缩短为3分钟，更频繁保存
-    }
-
-    async cleanup(closeBrowser = true) {
-        if (this.cleanupInterval) {
-            clearInterval(this.cleanupInterval);
-            this.cleanupInterval = null;
-        }
-        if (this.autoSaveInterval) {
-            clearInterval(this.autoSaveInterval);
-            this.autoSaveInterval = null;
-        }
-
-        await this.cleanupContext();
-        
-        if (closeBrowser && this.browser) {
-            await this.browser.close().catch(() => {});
-            this.browser = null;
-            logWithFlush('[清理] 浏览器进程已关闭');
-        }
-    }
-
-    // 🔥 立即保存会话（在关键操作后调用）
-    async saveSessionNow() {
-        if (this.context && isLoggedIn) {
-            try {
-                const sessionData = await this.context.storageState();
-                await fs.writeJson(SESSION_FILE, sessionData);
-                logWithFlush('[会话] 会话已立即保存');
-                return true;
-            } catch (error) {
-                if (!error.message.includes('closed')) {
-                    logErrorWithFlush('[会话] 立即保存失败:', error.message);
-                }
-                return false;
-            }
-        }
-        return false;
-    }
-}
-
-const browserManager = new BrowserManager();
-
+// ========================= 核心功能函数 =========================
 async function initBrowser() {
     const { browser: br, context: ctx } = await browserManager.init();
     browser = br;
@@ -240,10 +317,7 @@ async function checkLoginStatus() {
                 isLoggedIn = true;
                 lastActivityTime = Date.now();
                 logWithFlush('[登录检查] ✅ 用户已登录');
-                
-                // 🔥 登录状态确认后立即保存会话
                 await browserManager.saveSessionNow();
-                
                 return true;
             } catch {
                 isLoggedIn = false;
@@ -252,7 +326,7 @@ async function checkLoginStatus() {
             }
         } catch (error) {
             lastError = error;
-            logErrorWithFlush(`[登录检查] 登录状态检查失败 (尝试 ${i + 1}):`, error.message);
+            logErrorWithFlush(`[登录检查] 失败 (尝试 ${i + 1}):`, error.message);
             if (i < maxRetries - 1) {
                 await new Promise(resolve => setTimeout(resolve, 2000));
             }
@@ -297,7 +371,7 @@ async function getQRCode() {
             }
         } catch (error) {
             lastError = error;
-            logErrorWithFlush(`[二维码] 获取二维码失败 (尝试 ${i + 1}):`, error.message);
+            logErrorWithFlush(`[二维码] 失败 (尝试 ${i + 1}):`, error.message);
             if (i < maxRetries - 1) {
                 await new Promise(resolve => setTimeout(resolve, 2000));
             }
@@ -324,11 +398,8 @@ async function checkScanStatus() {
         if (currentUrl.includes('weibo.com') && !currentUrl.includes('passport')) {
             isLoggedIn = true;
             lastActivityTime = Date.now();
-            
-            // 🔥 登录成功后立即保存会话
             logWithFlush('[扫码状态] ✅ 用户扫码登录成功！');
             await browserManager.saveSessionNow();
-            
             await loginPage.close();
             loginPage = null;
             return { status: 'success', message: '登录成功' };
@@ -358,7 +429,7 @@ async function checkScanStatus() {
         }
         return { status: 'waiting', message: statusMessage };
     } catch (error) {
-        logErrorWithFlush('[扫码状态] 检查扫码状态失败:', error.message);
+        logErrorWithFlush('[扫码状态] 失败:', error.message);
         if (loginPage && !loginPage.isClosed()) {
             await loginPage.close();
             loginPage = null;
@@ -374,7 +445,7 @@ async function postWeibo(content) {
     for (let i = 0; i < maxRetries; i++) {
         let page = null;
         try {
-            logWithFlush(`[发送微博] 开始发送微博 (尝试 ${i + 1}/${maxRetries})`);
+            logWithFlush(`[发送微博] 开始发送 (尝试 ${i + 1}/${maxRetries})`);
             
             if (!isLoggedIn) throw new Error('用户未登录');
             await initBrowser();
@@ -394,21 +465,18 @@ async function postWeibo(content) {
             const result = await response.json();
             if (result.ok === 1) {
                 lastActivityTime = Date.now();
-                logWithFlush('[发送微博] ✅ 微博发送成功!');
-                
-                // 🔥 关键：发送成功后立即保存会话
+                logWithFlush('[发送微博] ✅ 发送成功!');
                 await browserManager.saveSessionNow();
-                
                 return {
                     success: true, message: '微博发送成功',
                     weiboId: result.data?.idstr, content: result.data?.text_raw || content,
                 };
             } else {
-                throw new Error(`微博接口返回失败: ${result.msg || '未知错误'}`);
+                throw new Error(`接口返回失败: ${result.msg || '未知错误'}`);
             }
         } catch (error) {
             lastError = error;
-            logErrorWithFlush(`[发送微博] 发送微博失败 (尝试 ${i + 1}):`, error.message);
+            logErrorWithFlush(`[发送微博] 失败 (尝试 ${i + 1}):`, error.message);
             if (i < maxRetries - 1) {
                 await new Promise(resolve => setTimeout(resolve, 3000));
             }
@@ -422,107 +490,127 @@ async function postWeibo(content) {
     throw lastError || new Error('发送微博失败');
 }
 
-// API路由
+// ========================= API 路由（使用队列） =========================
 app.get('/api/status', async (req, res) => {
     try {
-        logWithFlush('[API] 收到登录状态检查请求');
-        const loginStatus = await checkLoginStatus();
+        const loginStatus = await requestQueue.enqueue(
+            () => checkLoginStatus(),
+            'checkLoginStatus'
+        );
         res.json({ isLoggedIn: loginStatus });
     } catch (error) {
-        logErrorWithFlush('[API] 状态检查 API 错误:', error);
+        logErrorWithFlush('[API] 状态检查错误:', error);
         res.status(500).json({ error: error.message });
     }
 });
 
 app.get('/api/qrcode', async (req, res) => {
     try {
-        logWithFlush('[API] 收到获取二维码请求');
-        const qrCodeUrl = await getQRCode();
+        const qrCodeUrl = await requestQueue.enqueue(
+            () => getQRCode(),
+            'getQRCode'
+        );
         res.json({ qrCodeUrl });
     } catch (error) {
-        logErrorWithFlush('[API] 二维码 API 错误:', error);
+        logErrorWithFlush('[API] 二维码错误:', error);
         res.status(500).json({ error: error.message });
     }
 });
 
 app.get('/api/scan-status', async (req, res) => {
     try {
-        const status = await checkScanStatus();
+        const status = await requestQueue.enqueue(
+            () => checkScanStatus(),
+            'checkScanStatus'
+        );
         res.json(status);
     } catch (error) {
-        logErrorWithFlush('[API] 扫码状态 API 错误:', error);
+        logErrorWithFlush('[API] 扫码状态错误:', error);
         res.status(500).json({ error: error.message });
     }
 });
 
 app.post('/api/post', async (req, res) => {
     try {
-        logWithFlush('[API] ========== 收到发送微博请求 ==========');
         const { content } = req.body;
         if (!content || typeof content !== 'string' || content.length > 2000) {
             return res.status(400).json({ error: '内容无效或过长' });
         }
         
-        const result = await postWeibo(content);
+        const result = await requestQueue.enqueue(
+            () => postWeibo(content),
+            'postWeibo'
+        );
         res.json(result);
     } catch (error) {
-        logErrorWithFlush('[API] ❌ 发送微博 API 错误:', error.message);
+        logErrorWithFlush('[API] 发送微博错误:', error.message);
         res.status(500).json({ error: error.message });
     }
 });
 
 app.post('/api/logout', async (req, res) => {
     try {
-        logWithFlush('[API] 收到退出登录请求');
-        if (await fs.pathExists(SESSION_FILE)) {
-            await fs.remove(SESSION_FILE);
-        }
-        isLoggedIn = false;
-        
-        if (loginPage && !loginPage.isClosed()) {
-            await loginPage.close();
-            loginPage = null;
-        }
+        await requestQueue.enqueue(async () => {
+            logWithFlush('[API] 收到退出登录请求');
+            if (await fs.pathExists(SESSION_FILE)) {
+                await fs.remove(SESSION_FILE);
+            }
+            isLoggedIn = false;
+            
+            if (loginPage && !loginPage.isClosed()) {
+                await loginPage.close();
+                loginPage = null;
+            }
 
-        await browserManager.cleanup(false);
+            await browserManager.cleanup(false);
+        }, 'logout');
+        
         res.json({ success: true, message: '退出登录成功' });
     } catch (error) {
-        logErrorWithFlush('[API] 退出登录 API 错误:', error);
+        logErrorWithFlush('[API] 退出登录错误:', error);
         res.status(500).json({ error: error.message });
     }
 });
 
 app.get('/health', (req, res) => {
+    const queueStatus = requestQueue.getStatus();
     const healthInfo = { 
         status: 'ok', 
         timestamp: new Date().toISOString(),
         isLoggedIn: isLoggedIn,
         browserStatus: browser ? 'running' : 'stopped',
         contextStatus: context ? 'active' : 'closed',
-        lastActivity: new Date(lastActivityTime).toISOString()
+        lastActivity: new Date(lastActivityTime).toISOString(),
+        queue: queueStatus
     };
     res.json(healthInfo);
 });
 
 app.use((err, req, res, next) => {
-    logErrorWithFlush('[错误处理] 错误详情:', err.message);
+    logErrorWithFlush('[错误处理]:', err.message);
     if (err instanceof SyntaxError && err.status === 400 && 'body' in err) {
         return res.status(400).json({ error: '请求体JSON格式错误' });
     }
     res.status(500).json({ error: '服务器内部错误' });
 });
 
-// 🔥 优化的关闭处理：不再尝试保存会话
+// ========================= 优雅关闭 =========================
 async function gracefulShutdown(signal) {
-    logWithFlush(`[关闭] 收到 ${signal} 信号，正在优雅关闭...`);
-    logWithFlush(`[关闭] 会话已在之前的操作中保存，无需再次保存`);
+    logWithFlush(`[关闭] 收到 ${signal} 信号`);
+    
+    // 等待队列清空（最多等待30秒）
+    const maxWait = 30000;
+    const startTime = Date.now();
+    while (requestQueue.processing && (Date.now() - startTime) < maxWait) {
+        logWithFlush(`[关闭] 等待队列完成: ${requestQueue.getStatus().currentOperation}`);
+        await new Promise(resolve => setTimeout(resolve, 1000));
+    }
     
     try {
-        // 🔥 直接清理资源，不尝试保存会话
         await browserManager.cleanup(true);
         logWithFlush('[关闭] 资源清理完成');
     } catch (error) {
-        logErrorWithFlush('[关闭] 清理资源时出错:', error.message);
+        logErrorWithFlush('[关闭] 清理错误:', error.message);
     }
     process.exit(0);
 }
@@ -531,12 +619,12 @@ process.on('SIGINT', () => gracefulShutdown('SIGINT'));
 process.on('SIGTERM', () => gracefulShutdown('SIGTERM'));
 
 process.on('unhandledRejection', (reason) => {
-    logErrorWithFlush('[Promise拒绝] 未处理的 Promise 拒绝:', reason);
+    logErrorWithFlush('[Promise拒绝]:', reason);
 });
 
 app.listen(PORT, () => {
     logWithFlush(`[启动] 🚀 服务器运行在端口 ${PORT}`);
-    logWithFlush(`[启动] 🌐 访问地址: http://localhost:${PORT}`);
+    logWithFlush(`[启动] 🌐 访问: http://localhost:${PORT}`);
     logWithFlush(`[启动] ❤️ 健康检查: http://localhost:${PORT}/health`);
-    logWithFlush(`[启动] 💾 会话策略：关键操作后立即保存，SIGTERM 时使用已保存的会话`);
+    logWithFlush(`[启动] 🔄 请求队列已启用，自动处理并发冲突`);
 });
