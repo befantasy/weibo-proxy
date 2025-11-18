@@ -90,7 +90,6 @@ class BrowserManager {
         this.lastActivity = Date.now();
         this.idleTimeout = 10 * 60 * 1000;
         this.cleanupInterval = null;
-        this.autoSaveInterval = null;
         this.isInitializing = false; // 防止重复初始化
     }
 
@@ -146,7 +145,6 @@ class BrowserManager {
 
             this.updateActivity();
             this.startCleanupTimer();
-            this.startAutoSave();
             
             return { browser: this.browser, context: this.context };
         } finally {
@@ -180,34 +178,10 @@ class BrowserManager {
         }, 60000);
     }
 
-    startAutoSave() {
-        if (this.autoSaveInterval) return;
-        
-        this.autoSaveInterval = setInterval(async () => {
-            // 只在没有任务处理时保存
-            if (this.context && isLoggedIn && !requestQueue.processing) {
-                try {
-                    logWithFlush('[定期保存] 自动保存登录会话...');
-                    const sessionData = await this.context.storageState();
-                    await fs.writeJson(SESSION_FILE, sessionData);
-                    logWithFlush('[定期保存] 会话保存成功');
-                } catch (error) {
-                    if (!error.message.includes('closed')) {
-                        logErrorWithFlush('[定期保存] 保存失败:', error.message);
-                    }
-                }
-            }
-        }, 3 * 60 * 1000);
-    }
-
     async cleanup(closeBrowser = true) {
         if (this.cleanupInterval) {
             clearInterval(this.cleanupInterval);
             this.cleanupInterval = null;
-        }
-        if (this.autoSaveInterval) {
-            clearInterval(this.autoSaveInterval);
-            this.autoSaveInterval = null;
         }
 
         await this.cleanupContext();
@@ -224,11 +198,11 @@ class BrowserManager {
             try {
                 const sessionData = await this.context.storageState();
                 await fs.writeJson(SESSION_FILE, sessionData);
-                logWithFlush('[会话] 会话已立即保存');
+                logWithFlush('[会话] 会话已保存');
                 return true;
             } catch (error) {
                 if (!error.message.includes('closed')) {
-                    logErrorWithFlush('[会话] 立即保存失败:', error.message);
+                    logErrorWithFlush('[会话] 保存失败:', error.message);
                 }
                 return false;
             }
