@@ -10,30 +10,18 @@ services:
     environment:
       - NODE_ENV=production
       - PORT=3000
-      # 关键优化：降低内存限制
-      - NODE_OPTIONS=--max-old-space-size=300 --expose-gc
+      - NODE_OPTIONS=--max-old-space-size=300
       - PLAYWRIGHT_BROWSERS_PATH=/ms-playwright
-      # Chromium 优化参数
       - PLAYWRIGHT_CHROMIUM_USE_HEADLESS_NEW=1
-      # 更激进的内存优化
-      - PLAYWRIGHT_CHROMIUM_ARGS=--disable-gpu --no-sandbox --disable-dev-shm-usage --disable-software-rasterizer --disable-dev-tools --disable-extensions --disable-logging --disable-breakpad --disable-background-networking --disable-background-timer-throttling --disable-backgrounding-occluded-windows --disable-renderer-backgrounding --disable-hang-monitor --disable-prompt-on-repost --disable-sync --disable-translate --metrics-recording-only --no-first-run --safebrowsing-disable-auto-update --disable-blink-features=AutomationControlled --js-flags="--max-old-space-size=128"
-      # 新增：垃圾回收优化
-      - UV_THREADPOOL_SIZE=2
+      - PLAYWRIGHT_CHROMIUM_ARGS=--no-sandbox --disable-setuid-sandbox --disable-dev-shm-usage
+
     restart: unless-stopped
-    
-    # 关键：放宽健康检查，避免误杀
+
     healthcheck:
-      test: ["CMD", "wget", "--no-verbose", "--tries=1", "--spider", "http://localhost:3000/health"]
-      interval: 300s      # 5分钟检查一次
-      timeout: 30s        # 超时时间30秒
-      retries: 5          # 失败5次才重启
-      start_period: 60s   # 启动期60秒
-    
-    # OOM 处理
+      test: ["CMD", "curl", "-f", "http://localhost:3000/health"]
+      interval: 120s
+      timeout: 30s
+      retries: 5
+      start_period: 60s
+
     oom_kill_disable: false
-    oom_score_adj: 0
-    
-    # 不设置内存限制，让 Render 平台控制
-    # mem_limit: 450m
-    # memswap_limit: 450m
-    # mem_reservation: 256m
