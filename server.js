@@ -5,11 +5,11 @@ const cors = require('cors');
 const fs = require('fs-extra');
 const path = require('path');
 const { chromium } = require('playwright');
-const os = require('os'); // 引入OS模块用于监控
+const { exec } = require('child_process'); // 引入用于执行 ps 命令的模块
 const app = express();
 const PORT = process.env.PORT || 3000;
 
-// ========================= 日志与监控 =========================
+// ========================= 日志与工具函数 =========================
 
 function logWithFlush(...args) {
     const timestamp = new Date().toISOString().split('T')[1].split('.')[0];
@@ -21,19 +21,58 @@ function logErrorWithFlush(...args) {
     console.error(`[${timestamp}]`, ...args);
 }
 
-// 后台内存监控（仅在控制台显示，不在接口返回）
+// ========================= 增强版真实内存监控 (每60秒) =========================
 setInterval(() => {
-    const mem = process.memoryUsage();
-    const freeMemOS = os.freemem() / 1024 / 1024;
-    const totalMemOS = os.totalmem() / 1024 / 1024;
-    
-    // 这里的 RSS 是 Node 进程的总物理内存占用
-    // 在 Render 容器中，如果 RSS 接近 512MB 就会被杀
-    const rssMB = (mem.rss / 1024 / 1024).toFixed(2);
-    const heapUsedMB = (mem.heapUsed / 1024 / 1024).toFixed(2);
-    
-    logWithFlush(`[系统监控] Node内存: RSS=${rssMB}MB Heap=${heapUsedMB}MB | 浏览器: ${browserManager.browser ? '🟢运行中' : '⚫已停止'} | 队列: ${requestQueue.queue.length}`);
-}, 15000); // 每15秒打印一次
+    // 1. 获取 Node.js 自身内存 (RSS: 驻留集大小，即物理内存)
+    const nodeMem = process.memoryUsage();
+    const nodeRssMB = (nodeMem.rss / 1024 / 1024).toFixed(2);
+
+    // 2. 通过 Linux ps 命令获取 Chromium 进程组的内存
+    // Render/Docker 容器中 process.memoryUsage 无法统计子进程内存
+    exec('ps -A -o rss,args', (error, stdout, stderr) => {
+        if (error) {
+            logErrorWithFlush('[监控] 无法执行 ps 命令:', error.message);
+            return;
+        }
+
+        let chromeTotalKB = 0;
+        let chromeProcessCount = 0;
+        
+        const lines = stdout.split('\n');
+        lines.forEach(line => {
+            // 过滤包含 chrome 或 playwright 的进程，但排除 grep 和当前命令
+            if ((line.includes('chrome') || line.includes('chromium')) && !line.includes('grep')) {
+                const parts = line.trim().split(/\s+/);
+                // parts[0] 是 RSS (单位 KB)
+                const rss = parseInt(parts[0], 10);
+                if (!isNaN(rss)) {
+                    chromeTotalKB += rss;
+                    chromeProcessCount++;
+                }
+            }
+        });
+
+        const chromeTotalMB = (chromeTotalKB / 1024).toFixed(2);
+        // 计算总内存占用 (Node主进程 + Chromium子进程)
+        const totalUsageMB = (parseFloat(nodeRssMB) + parseFloat(chromeTotalMB)).toFixed(2);
+
+        const statusIcon = browserManager.browser ? '🟢' : '⚫';
+        const browserState = browserManager.browser ? '运行中' : '已停止';
+        
+        // 打印综合报告
+        logWithFlush(
+            `[内存监控] 总占用: ${totalUsageMB}MB | ` +
+            `Node: ${nodeRssMB}MB | ` +
+            `Chromium: ${chromeTotalMB}MB (${chromeProcessCount}个进程) | ` +
+            `状态: ${statusIcon}${browserState}`
+        );
+        
+        // ⚠️ 预警：Render 免费版限制 512MB，超过 450MB 非常危险
+        if (totalUsageMB > 450) {
+            logErrorWithFlush(`[⚠️高危预警] 内存即将耗尽 (${totalUsageMB}MB/512MB)，请注意 SIGTERM 风险`);
+        }
+    });
+}, 60000); // 每 60 秒执行一次
 
 // ========================= 浏览器资源管理器 =========================
 class BrowserManager {
@@ -68,14 +107,14 @@ class BrowserManager {
                 args: [
                     '--no-sandbox',
                     '--disable-setuid-sandbox',
-                    '--disable-dev-shm-usage', // 关键：解决容器内存不足
+                    '--disable-dev-shm-usage', // 关键：解决 Docker/Render 内存不足崩溃
                     '--disable-gpu',
                     '--no-first-run',
                     '--no-zygote',
-                    '--renderer-process-limit=1', // 关键：限制渲染进程数量
-                    '--single-process', // ⚠️ 激进模式：单进程运行（最省内存，但可能不稳定，如果报错请去掉此行）
+                    '--renderer-process-limit=1', // 关键：严格限制渲染进程数
                     '--disable-extensions',
                     '--disable-audio-output',
+                    '--disable-gl-drawing-for-tests',
                 ]
             });
 
@@ -184,14 +223,13 @@ class RequestQueue {
     }
 
     async processQueue() {
-        if (this.processing) return; // 已经在跑了，不重复触发
+        if (this.processing) return; 
         if (this.queue.length === 0) return;
 
         this.processing = true;
 
         try {
-            // 1. 在处理任务前，确保浏览器是活着的
-            // 这是"按需启动"的关键
+            // 1. 任务开始前：确保浏览器启动 (按需启动)
             await browserManager.init();
 
             while (this.queue.length > 0) {
@@ -207,7 +245,7 @@ class RequestQueue {
                     logErrorWithFlush(`[队列] 任务失败: ${task.operationName}`, error.message);
                     task.reject(error);
                 } finally {
-                    // 每个任务结束后，尝试保存一次 Session，防止崩溃丢失
+                    // 每个任务结束后保存 Session
                     if (browserManager.isLoggedIn) {
                         await browserManager.saveSessionNow();
                     }
@@ -219,8 +257,7 @@ class RequestQueue {
             this.currentOperation = null;
             this.processing = false;
 
-            // 2. 队列空了，立即销毁浏览器！
-            // 这是解决 512MB 内存限制的核心策略
+            // 2. 任务结束后：立即销毁浏览器 (用完即焚)
             if (this.queue.length === 0) {
                 logWithFlush('[队列] 队列已空，立即执行资源回收...');
                 await browserManager.cleanup(true);
@@ -243,7 +280,7 @@ const requestQueue = new RequestQueue();
 app.use(cors());
 app.use(express.json({ limit: '50kb' }));
 
-// 中间件：简单鉴权
+// 中间件：鉴权
 function authenticateToken(req, res, next) {
     const authHeader = req.headers['authorization'];
     const token = authHeader && authHeader.split(' ')[1];
@@ -271,13 +308,11 @@ async function loadSession() {
 }
 
 async function checkLoginStatus() {
-    // 注意：此处不需要再调用 browserManager.init()，队列逻辑已保证 Browser 存在
     const page = await browserManager.context.newPage();
     try {
         logWithFlush('[业务] 访问微博主页验证登录...');
         await page.goto('https://weibo.com', { waitUntil: 'domcontentloaded', timeout: 15000 });
         
-        // 检查特定元素
         try {
             await page.waitForSelector('textarea[placeholder*="新鲜事"]', { timeout: 8000 });
             browserManager.setLoggedIn(true);
@@ -294,11 +329,10 @@ async function checkLoginStatus() {
 }
 
 async function getQRCode() {
-    // 确保旧的登录页关闭
     await browserManager.closeLoginPage();
     
     const page = await browserManager.context.newPage();
-    browserManager.loginPage = page; // 保存引用以便后续查询状态
+    browserManager.loginPage = page; 
 
     await page.goto('https://passport.weibo.com/sso/signin?entry=miniblog&source=miniblog', {
         waitUntil: 'domcontentloaded', timeout: 15000
@@ -334,7 +368,6 @@ async function checkScanStatus() {
         return { status: 'success', message: '登录成功' };
     }
 
-    // 简单的文本检测
     const bodyText = await page.evaluate(() => document.body.innerText);
     if (bodyText.includes('扫描成功') || bodyText.includes('请确认')) {
         return { status: 'waiting', message: '扫描成功，请在手机确认' };
@@ -359,11 +392,9 @@ async function postWeibo(content) {
         await page.waitForSelector(inputSelector, { timeout: 10000 });
         await page.fill(inputSelector, content);
         
-        // 等待发送按钮变为可用
         const btnSelector = 'button:has-text("发送"):not([disabled])';
         await page.waitForSelector(btnSelector, { timeout: 5000 });
 
-        // 监听网络请求确认成功
         const [response] = await Promise.all([
             page.waitForResponse(res => res.url().includes('/ajax/statuses/update') && res.status() === 200, { timeout: 10000 }),
             page.click(btnSelector)
@@ -405,8 +436,6 @@ app.get('/api/qrcode', async (req, res) => {
 
 app.get('/api/scan-status', async (req, res) => {
     try {
-        // 扫码状态检查比较特殊，如果页面没了，可能不需要启动整个浏览器流程
-        // 但为了统一管理，我们还是放入队列，依赖浏览器的 Context 状态
         const result = await requestQueue.enqueue(() => checkScanStatus(), 'checkScan');
         res.json(result);
     } catch (e) {
@@ -426,13 +455,26 @@ app.post('/api/post', async (req, res) => {
     }
 });
 
-// Health Check - 仅返回简单状态，不包含内存数据
+app.post('/api/logout', async (req, res) => {
+    try {
+        await requestQueue.enqueue(async () => {
+            logWithFlush('[API] 退出登录');
+            if (await fs.pathExists(SESSION_FILE)) {
+                await fs.remove(SESSION_FILE);
+            }
+            browserManager.setLoggedIn(false);
+        }, 'logout');
+        res.json({ success: true });
+    } catch (e) {
+        res.status(500).json({ error: e.message });
+    }
+});
+
 app.get('/health', (req, res) => {
     res.json({
         status: 'ok',
         timestamp: new Date().toISOString(),
-        queueLength: requestQueue.queue.length,
-        processing: requestQueue.processing,
+        queue: requestQueue.getStatus(),
         isLoggedIn: browserManager.isLoggedIn
     });
 });
@@ -442,7 +484,6 @@ app.get('/health', (req, res) => {
 async function gracefulShutdown(signal) {
     logWithFlush(`[关闭] 收到 ${signal}，正在停止服务...`);
     
-    // 等待当前任务完成
     if (requestQueue.processing) {
         logWithFlush('[关闭] 等待当前任务结束...');
         await new Promise(resolve => setTimeout(resolve, 3000));
@@ -457,5 +498,5 @@ process.on('SIGTERM', () => gracefulShutdown('SIGTERM'));
 
 app.listen(PORT, () => {
     logWithFlush(`[启动] 服务器运行在端口 ${PORT}`);
-    logWithFlush(`[启动] 内存保护模式: 开启 (空闲时自动销毁浏览器)`);
+    logWithFlush(`[启动] 内存保护模式: 开启 (按需启动/销毁浏览器)`);
 });
