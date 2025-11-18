@@ -88,7 +88,7 @@ class BrowserManager {
         this.browser = null;
         this.context = null;
         this.lastActivity = Date.now();
-        this.idleTimeout = 2 * 60 * 1000;
+        this.idleTimeout = 5 * 60 * 1000;
         this.cleanupInterval = null;
         this.autoSaveInterval = null;
         this.isInitializing = false; // 防止重复初始化
