@@ -124,7 +124,7 @@ class BrowserManager {
                         '--disable-background-timer-throttling',
                         '--disable-backgrounding-occluded-windows',
                         '--disable-renderer-backgrounding',
-                        '--max_old_space_size=400',
+                        '--max_old_space_size=350',
                         '--disable-features=Translate,BackForwardCache,VizDisplayCompositor',
                     ]
                 });
