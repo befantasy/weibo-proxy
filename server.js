@@ -123,8 +123,6 @@ class BrowserManager {
                         '--disable-renderer-backgrounding',
                         '--max_old_space_size=256',
                         '--disable-features=Translate,BackForwardCache,VizDisplayCompositor',
-                        '--single-process',
-                        '--disable-features=site-per-process',
                     ]
                 });
             }
