@@ -576,18 +576,25 @@ app.post('/api/logout', async (req, res) => {
 });
 
 app.get('/health', (req, res) => {
-    const queueStatus = requestQueue.getStatus();
-    const healthInfo = { 
-        status: 'ok', 
-        timestamp: new Date().toISOString(),
-        isLoggedIn: browserManager.isLoggedIn,
-        browserStatus: browserManager.browser ? 'running' : 'stopped',
-        contextStatus: browserManager.context ? 'active' : 'closed',
-        lastActivity: new Date(browserManager.lastActivity).toISOString(),
-        operationCount: browserManager.operationCount,
-        queue: queueStatus
-    };
-    res.json(healthInfo);
+  const mem = process.memoryUsage();
+  const queueStatus = requestQueue.getStatus();
+  const healthInfo = {
+    status: 'ok',
+    timestamp: new Date().toISOString(),
+    isLoggedIn: browserManager.isLoggedIn,
+    browserStatus: browserManager.browser ? 'running' : 'stopped',
+    contextStatus: browserManager.context ? 'active' : 'closed',
+    lastActivity: new Date(browserManager.lastActivity).toISOString(),
+    operationCount: browserManager.operationCount,
+    memory: {
+      rss: mem.rss,
+      heapTotal: mem.heapTotal,
+      heapUsed: mem.heapUsed,
+      external: mem.external
+    },
+    queue: queueStatus
+  };
+  res.json(healthInfo);
 });
 
 app.use((err, req, res, next) => {
