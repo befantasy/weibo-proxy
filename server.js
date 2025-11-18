@@ -119,13 +119,16 @@ class BrowserManager {
                 this.browser = await chromium.launch({
                     headless: true,
                     args: [
-                        '--no-sandbox', '--disable-setuid-sandbox', '--disable-dev-shm-usage',
-                        '--disable-web-security', '--disable-gpu', '--disable-extensions',
+                        '--no-sandbox',
+                        '--disable-setuid-sandbox',
+                        '--disable-dev-shm-usage',
+                        '--disable-gpu',
+                        '--disable-extensions',
+                        '--renderer-process-limit=1',
+                        '--no-zygote',
                         '--disable-background-timer-throttling',
                         '--disable-backgrounding-occluded-windows',
-                        '--disable-renderer-backgrounding',
-                        '--max_old_space_size=350',
-                        '--disable-features=Translate,BackForwardCache,VizDisplayCompositor',
+                        '--disable-renderer-backgrounding'
                     ]
                 });
             }
