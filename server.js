@@ -90,7 +90,7 @@ class BrowserManager {
         this.loginPage = null;
         this.isLoggedIn = false;
         this.lastActivity = Date.now();
-        this.idleTimeout = 10 * 60 * 1000;
+        this.idleTimeout = 3 * 60 * 1000;
         this.cleanupInterval = null;
         this.isInitializing = false;
         this.operationCount = 0;
