@@ -88,14 +88,17 @@ class BrowserManager {
         this.browser = null;
         this.context = null;
         this.lastActivity = Date.now();
-        this.idleTimeout = 10 * 60 * 1000;
+        // 关键修复1：缩短空闲超时到2分钟（而不是5分钟）
+        this.idleTimeout = 2 * 60 * 1000;
         this.cleanupInterval = null;
         this.autoSaveInterval = null;
-        this.isInitializing = false; // 防止重复初始化
+        this.isInitializing = false;
+        this.forceCleanupInterval = null;
+        this.memoryWarningThreshold = 350; // MB
+        this.memoryDangerThreshold = 400; // MB
     }
 
     async init() {
-        // 防止并发初始化
         if (this.isInitializing) {
             logWithFlush('[浏览器] 正在初始化中，等待完成...');
             while (this.isInitializing) {
@@ -116,13 +119,46 @@ class BrowserManager {
                 this.browser = await chromium.launch({
                     headless: true,
                     args: [
-                        '--no-sandbox', '--disable-setuid-sandbox', '--disable-dev-shm-usage',
-                        '--disable-web-security', '--disable-gpu', '--disable-extensions',
+                        '--no-sandbox',
+                        '--disable-setuid-sandbox',
+                        '--disable-dev-shm-usage',
+                        '--disable-web-security',
+                        '--disable-gpu',
+                        '--disable-software-rasterizer',
+                        '--disable-dev-tools',
+                        '--disable-extensions',
+                        '--disable-logging',
+                        '--disable-breakpad',
                         '--disable-background-timer-throttling',
                         '--disable-backgrounding-occluded-windows',
                         '--disable-renderer-backgrounding',
-                        '--max_old_space_size=256',
-                        '--disable-features=Translate,BackForwardCache,VizDisplayCompositor',
+                        '--disable-hang-monitor',
+                        '--disable-prompt-on-repost',
+                        '--disable-sync',
+                        '--disable-translate',
+                        '--metrics-recording-only',
+                        '--no-first-run',
+                        '--safebrowsing-disable-auto-update',
+                        '--disable-blink-features=AutomationControlled',
+                        // 关键：更激进的内存限制
+                        '--js-flags=--max-old-space-size=100',  // 从128降到100
+                        '--disable-accelerated-2d-canvas',
+                        '--disable-accelerated-jpeg-decoding',
+                        '--disable-accelerated-mjpeg-decode',
+                        '--disable-accelerated-video-decode',
+                        '--disable-audio-output',
+                        '--disable-background-networking',
+                        '--disable-default-apps',
+                        '--disable-notifications',
+                        '--disable-offer-store-unmasked-wallet-cards',
+                        '--disable-speech-api',
+                        '--hide-scrollbars',
+                        '--mute-audio',
+                        '--no-default-browser-check',
+                        '--no-pings',
+                        // 新增：更多内存优化
+                        '--single-process',  // 单进程模式，减少内存
+                        '--disable-features=site-per-process',
                     ]
                 });
             }
@@ -136,17 +172,29 @@ class BrowserManager {
                 logWithFlush('[浏览器] 创建浏览器上下文...');
                 const sessionData = await loadSession();
                 const contextOptions = {
-                    userAgent: 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36'
+                    userAgent: 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36',
+                    javaScriptEnabled: true,
+                    bypassCSP: true,
                 };
                 if (sessionData) {
                     contextOptions.storageState = sessionData;
                 }
                 this.context = await this.browser.newContext(contextOptions);
+                
+                // 拦截资源
+                await this.context.route('**/*', (route) => {
+                    const resourceType = route.request().resourceType();
+                    if (['image', 'font', 'media', 'websocket'].includes(resourceType)) {
+                        return route.abort();
+                    }
+                    return route.continue();
+                });
             }
 
             this.updateActivity();
             this.startCleanupTimer();
             this.startAutoSave();
+            this.startForceCleanup();
             
             return { browser: this.browser, context: this.context };
         } finally {
@@ -164,27 +212,38 @@ class BrowserManager {
             await this.context.close().catch(() => {});
             this.context = null;
             logWithFlush('[清理] 浏览器上下文已关闭');
+            
+            // 强制垃圾回收
+            if (global.gc) {
+                global.gc();
+                logWithFlush('[清理] 已触发垃圾回收');
+            }
         }
     }
 
     startCleanupTimer() {
         if (this.cleanupInterval) return;
         
+        // 关键修复2：缩短检查间隔到30秒（而不是60秒）
         this.cleanupInterval = setInterval(async () => {
             const idleTime = Date.now() - this.lastActivity;
-            // 如果有任务在处理，不清理
             if (idleTime > this.idleTimeout && this.context && !requestQueue.processing) {
                 logWithFlush('[清理] 检测到长时间无活动，关闭浏览器上下文');
                 await this.cleanupContext();
             }
-        }, 60000);
+        }, 30000);  // 30秒检查一次
     }
 
     startAutoSave() {
         if (this.autoSaveInterval) return;
         
+        // 关键修复3：取消定期自动保存，改为只在操作后保存
+        // 定期保存会阻止内存释放，且没必要
+        logWithFlush('[会话] 已禁用定期自动保存，只在操作后保存');
+        
+        // 注释掉原来的代码
+        /*
         this.autoSaveInterval = setInterval(async () => {
-            // 只在没有任务处理时保存
             if (this.context && isLoggedIn && !requestQueue.processing) {
                 try {
                     logWithFlush('[定期保存] 自动保存登录会话...');
@@ -197,7 +256,37 @@ class BrowserManager {
                     }
                 }
             }
-        }, 3 * 60 * 1000);
+        }, 5 * 60 * 1000);
+        */
+    }
+
+    // 关键修复4：更激进的内存监控
+    startForceCleanup() {
+        if (this.forceCleanupInterval) return;
+        
+        this.forceCleanupInterval = setInterval(async () => {
+            const memUsage = process.memoryUsage();
+            const memUsageMB = Math.round(memUsage.heapUsed / 1024 / 1024);
+            const rssMB = Math.round(memUsage.rss / 1024 / 1024);
+            
+            logWithFlush(`[内存监控] 堆: ${memUsageMB}MB, RSS: ${rssMB}MB`);
+            
+            // 警告阈值：350MB
+            if (rssMB > this.memoryWarningThreshold) {
+                logWithFlush(`[内存监控] ⚠️ 内存使用接近限制 (${rssMB}MB > ${this.memoryWarningThreshold}MB)`);
+            }
+            
+            // 危险阈值：400MB，强制清理
+            if (rssMB > this.memoryDangerThreshold && !requestQueue.processing && this.context) {
+                logWithFlush(`[内存监控] 🚨 内存使用过高 (${rssMB}MB > ${this.memoryDangerThreshold}MB)，强制清理`);
+                await this.cleanupContext();
+            }
+            
+            // 主动触发垃圾回收
+            if (global.gc) {
+                global.gc();
+            }
+        }, 60 * 1000); // 每1分钟检查一次（而不是2分钟）
     }
 
     async cleanup(closeBrowser = true) {
@@ -209,6 +298,10 @@ class BrowserManager {
             clearInterval(this.autoSaveInterval);
             this.autoSaveInterval = null;
         }
+        if (this.forceCleanupInterval) {
+            clearInterval(this.forceCleanupInterval);
+            this.forceCleanupInterval = null;
+        }
 
         await this.cleanupContext();
         
@@ -219,12 +312,21 @@ class BrowserManager {
         }
     }
 
+    // 只在需要时立即保存
     async saveSessionNow() {
         if (this.context && isLoggedIn) {
             try {
                 const sessionData = await this.context.storageState();
                 await fs.writeJson(SESSION_FILE, sessionData);
                 logWithFlush('[会话] 会话已立即保存');
+                
+                // 保存后立即清理上下文（如果没有活动）
+                const idleTime = Date.now() - this.lastActivity;
+                if (idleTime > 30000 && !requestQueue.processing) { // 30秒无活动
+                    logWithFlush('[会话] 保存后自动清理上下文');
+                    await this.cleanupContext();
+                }
+                
                 return true;
             } catch (error) {
                 if (!error.message.includes('closed')) {
