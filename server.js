@@ -8,64 +8,54 @@ const { chromium } = require('playwright');
 const app = express();
 const PORT = process.env.PORT || 3000;
 
-function logWithFlush(...args) {
-    console.log(...args);
+// ========================= 工具函数 =========================
+function log(...args) {
+    console.log(`[${new Date().toISOString()}]`, ...args);
     if (process.stdout.write) process.stdout.write('');
 }
 
-function logErrorWithFlush(...args) {
-    console.error(...args);
+function logError(...args) {
+    console.error(`[${new Date().toISOString()}]`, ...args);
     if (process.stderr.write) process.stderr.write('');
 }
 
-// ========================= 请求队列管理器 =========================
+function formatBytes(bytes) {
+    return (bytes / 1024 / 1024).toFixed(2) + ' MB';
+}
+
+// ========================= 请求队列 =========================
 class RequestQueue {
     constructor() {
         this.queue = [];
         this.processing = false;
-        this.currentOperation = null;
     }
 
     async enqueue(operation, operationName = 'unknown') {
         return new Promise((resolve, reject) => {
-            const task = {
-                operation,
-                operationName,
-                resolve,
-                reject,
-                timestamp: Date.now()
-            };
-            
+            const task = { operation, operationName, resolve, reject, timestamp: Date.now() };
             this.queue.push(task);
-            logWithFlush(`[队列] 任务入队: ${operationName} (队列长度: ${this.queue.length})`);
-            
+            log(`[队列] 入队: ${operationName} (队列长度: ${this.queue.length})`);
             this.processQueue();
         });
     }
 
     async processQueue() {
-        if (this.processing || this.queue.length === 0) {
-            return;
-        }
+        if (this.processing || this.queue.length === 0) return;
 
         this.processing = true;
         const task = this.queue.shift();
-        this.currentOperation = task.operationName;
 
         try {
-            logWithFlush(`[队列] 开始执行: ${task.operationName} (等待时间: ${Date.now() - task.timestamp}ms)`);
+            log(`[队列] 执行: ${task.operationName} (等待: ${Date.now() - task.timestamp}ms)`);
             const result = await task.operation();
             task.resolve(result);
-            logWithFlush(`[队列] 执行成功: ${task.operationName}`);
+            log(`[队列] 完成: ${task.operationName}`);
         } catch (error) {
-            logErrorWithFlush(`[队列] 执行失败: ${task.operationName}`, error.message);
+            logError(`[队列] 失败: ${task.operationName}`, error.message);
             task.reject(error);
         } finally {
-            this.currentOperation = null;
             this.processing = false;
-            
             if (this.queue.length > 0) {
-                logWithFlush(`[队列] 继续处理队列 (剩余: ${this.queue.length})`);
                 setImmediate(() => this.processQueue());
             }
         }
@@ -74,218 +64,127 @@ class RequestQueue {
     getStatus() {
         return {
             queueLength: this.queue.length,
-            processing: this.processing,
-            currentOperation: this.currentOperation
+            processing: this.processing
         };
     }
 }
 
-const requestQueue = new RequestQueue();
+// ========================= 内存监控 =========================
+class MemoryMonitor {
+    constructor() {
+        this.startMonitoring();
+    }
 
-// ========================= 浏览器资源管理器 =========================
+    getMemoryInfo() {
+        const mem = process.memoryUsage();
+        return {
+            rss: formatBytes(mem.rss),
+            heapTotal: formatBytes(mem.heapTotal),
+            heapUsed: formatBytes(mem.heapUsed),
+            external: formatBytes(mem.external),
+            heapUsedPercent: ((mem.heapUsed / mem.heapTotal) * 100).toFixed(1) + '%',
+            timestamp: new Date().toISOString()
+        };
+    }
+
+    startMonitoring() {
+        setInterval(() => {
+            const memInfo = this.getMemoryInfo();
+            log(`[内存监控] RSS: ${memInfo.rss} | Heap: ${memInfo.heapUsed}/${memInfo.heapTotal} (${memInfo.heapUsedPercent}) | External: ${memInfo.external}`);
+            
+            // 仅在内存极度紧张时提示，不主动触发GC（避免影响性能）
+            const mem = process.memoryUsage();
+            if (mem.heapUsed / mem.heapTotal > 0.95) {
+                log('[内存监控] ⚠️  内存使用率过高 (>95%)，建议检查内存泄漏');
+            }
+        }, 60000); // 每分钟
+    }
+}
+
+// ========================= 浏览器管理器 =========================
 class BrowserManager {
     constructor() {
         this.browser = null;
         this.context = null;
-        this.loginPage = null;
-        this.isLoggedIn = false;
-        this.lastActivity = Date.now();
-        this.idleTimeout = 3 * 60 * 1000;
-        this.cleanupInterval = null;
-        this.isInitializing = false;
-        this.operationCount = 0;
-        this.contextRefreshThreshold = 20; // 每20个操作后考虑刷新context
     }
 
-    async init() {
-        // 防止并发初始化
-        if (this.isInitializing) {
-            logWithFlush('[浏览器] 正在初始化中，等待完成...');
-            while (this.isInitializing) {
-                await new Promise(resolve => setTimeout(resolve, 100));
-            }
-            return { browser: this.browser, context: this.context };
-        }
-
-        if (this.browser && this.context) {
-            this.updateActivity();
-            return { browser: this.browser, context: this.context };
-        }
-
-        this.isInitializing = true;
-        try {
-            if (!this.browser) {
-                logWithFlush('[浏览器] 启动浏览器...');
-                this.browser = await chromium.launch({
-                    headless: true,
-                    args: [
-                        '--no-sandbox',
-                        '--disable-setuid-sandbox',
-                        '--disable-dev-shm-usage',
-                        '--disable-gpu',
-                        '--disable-extensions',
-                        '--renderer-process-limit=1',
-                        '--no-zygote',
-                        '--disable-background-timer-throttling',
-                        '--disable-backgrounding-occluded-windows',
-                        '--disable-renderer-backgrounding'
-                    ]
-                });
-            }
-
-            if (this.context && !this.browser.isConnected()) {
-                await this.closeContext();
-            }
-
-            if (!this.context) {
-                await this.createContext();
-            }
-
-            this.updateActivity();
-            this.startCleanupTimer();
-            
-            return { browser: this.browser, context: this.context };
-        } finally {
-            this.isInitializing = false;
-        }
+    async launch() {
+        if (this.browser) return;
+        
+        log('[浏览器] 启动浏览器进程...');
+        this.browser = await chromium.launch({
+            headless: true,
+            args: [
+                '--no-sandbox',
+                '--disable-setuid-sandbox',
+                '--disable-dev-shm-usage',
+                '--disable-gpu',
+                '--disable-extensions',
+                '--single-process'
+            ]
+        });
     }
 
-    async createContext() {
-        logWithFlush('[浏览器] 创建浏览器上下文...');
-        const sessionData = await loadSession();
-        const contextOptions = {
+    async createContext(sessionData = null) {
+        await this.launch();
+        
+        log('[浏览器] 创建新上下文...');
+        const options = {
             userAgent: 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36'
         };
+        
         if (sessionData) {
-            contextOptions.storageState = sessionData;
-        }
-        this.context = await this.browser.newContext(contextOptions);
-        this.operationCount = 0;
-    }
-
-    async refreshContextIfNeeded() {
-        this.operationCount++;
-        
-        // 每达到阈值且空闲时刷新context（防止内存泄漏）
-        if (this.operationCount >= this.contextRefreshThreshold && !requestQueue.processing) {
-            logWithFlush(`[浏览器] 达到操作阈值 (${this.operationCount})，刷新上下文`);
-            await this.saveSessionNow();
-            await this.closeContext();
-            await this.createContext();
-        }
-    }
-
-    updateActivity() {
-        this.lastActivity = Date.now();
-    }
-
-    async closeContext() {
-        if (this.loginPage && !this.loginPage.isClosed()) {
-            await this.loginPage.close().catch(() => {});
-            this.loginPage = null;
+            options.storageState = sessionData;
         }
         
+        this.context = await this.browser.newContext(options);
+    }
+
+    async close() {
         if (this.context) {
-            logWithFlush('[清理] 关闭浏览器上下文...');
             await this.context.close().catch(() => {});
             this.context = null;
-            logWithFlush('[清理] 浏览器上下文已关闭');
+            log('[浏览器] 上下文已关闭');
         }
-    }
-
-    async closeLoginPage() {
-        if (this.loginPage && !this.loginPage.isClosed()) {
-            await this.loginPage.close().catch(() => {});
-            this.loginPage = null;
-            logWithFlush('[清理] 登录页面已关闭');
-        }
-    }
-
-    startCleanupTimer() {
-        if (this.cleanupInterval) return;
         
-        this.cleanupInterval = setInterval(async () => {
-            const idleTime = Date.now() - this.lastActivity;
-            // 如果有任务在处理，不清理
-            if (idleTime > this.idleTimeout && this.context && !requestQueue.processing) {
-                logWithFlush('[清理] 检测到长时间无活动，关闭浏览器上下文');
-                await this.closeContext();
-            }
-        }, 60000);
-    }
-
-    async cleanup(closeBrowser = true) {
-        if (this.cleanupInterval) {
-            clearInterval(this.cleanupInterval);
-            this.cleanupInterval = null;
-        }
-
-        await this.closeContext();
-        
-        if (closeBrowser && this.browser) {
+        if (this.browser) {
             await this.browser.close().catch(() => {});
             this.browser = null;
-            logWithFlush('[清理] 浏览器进程已关闭');
+            log('[浏览器] 浏览器进程已关闭');
         }
     }
 
-    async saveSessionNow() {
-        if (this.context && this.isLoggedIn) {
-            try {
-                // 检查context是否仍然有效
-                const pages = this.context.pages();
-                if (pages.length === 0 || !this.browser.isConnected()) {
-                    logWithFlush('[会话] Context无效，跳过保存');
-                    return false;
-                }
-                
-                const sessionData = await this.context.storageState();
-                await fs.writeJson(SESSION_FILE, sessionData);
-                logWithFlush('[会话] 会话已保存');
-                return true;
-            } catch (error) {
-                if (!error.message.includes('closed') && !error.message.includes('Target')) {
-                    logErrorWithFlush('[会话] 保存失败:', error.message);
-                }
-                return false;
-            }
+    async withBrowser(callback, needsSession = true) {
+        let sessionData = null;
+        
+        if (needsSession) {
+            sessionData = await loadSession();
         }
-        return false;
-    }
-
-    setLoggedIn(status) {
-        this.isLoggedIn = status;
-        if (status) {
-            this.updateActivity();
+        
+        try {
+            await this.createContext(sessionData);
+            const result = await callback(this.context);
+            return result;
+        } finally {
+            await this.close();
         }
     }
 }
 
 const browserManager = new BrowserManager();
+const requestQueue = new RequestQueue();
+const memoryMonitor = new MemoryMonitor();
 
-// ========================= 应用配置 =========================
+// ========================= 配置 =========================
 app.use(cors());
 app.use(express.json({ limit: '50kb' }));
-app.use('/api', (req, res, next) => {
-    if (req.method !== 'GET' && req.get('Content-Type')?.includes('application/json') && req.body === undefined) {
-        return res.status(400).json({ error: '请求体JSON格式错误' });
-    }
-    next();
-});
-
-app.use('/api', (req, res, next) => {
-    const queueStatus = requestQueue.getStatus();
-    logWithFlush(`[请求] ${req.method} ${req.path} (队列: ${queueStatus.queueLength}, 处理中: ${queueStatus.currentOperation || '无'})`);
-    next();
-});
-
 app.use(express.static('public'));
 
 function authenticateToken(req, res, next) {
     const authHeader = req.headers['authorization'];
     const token = authHeader && authHeader.split(' ')[1];
     if (!token || token !== AUTH_TOKEN) {
-        return res.status(401).json({ error: '未经授权：Token 无效或缺失' });
+        return res.status(401).json({ error: '未经授权' });
     }
     next();
 }
@@ -296,219 +195,184 @@ const DATA_DIR = path.join(__dirname, 'data');
 const SESSION_FILE = path.join(DATA_DIR, 'session.json');
 fs.ensureDirSync(DATA_DIR);
 
-// ========================= 核心功能函数 =========================
+// ========================= 会话管理 =========================
 async function loadSession() {
     try {
         if (await fs.pathExists(SESSION_FILE)) {
-            const sessionData = await fs.readJson(SESSION_FILE);
-            logWithFlush('[会话] 会话已加载');
-            return sessionData;
+            return await fs.readJson(SESSION_FILE);
         }
     } catch (error) {
-        logWithFlush('[会话] 加载会话失败:', error.message);
+        log('[会话] 加载失败:', error.message);
     }
     return null;
 }
 
-async function checkLoginStatus() {
-    const maxRetries = 2;
-    let lastError;
-    
-    for (let i = 0; i < maxRetries; i++) {
-        let page = null;
-        try {
-            logWithFlush(`[登录检查] 检查登录状态 (尝试 ${i + 1}/${maxRetries})`);
-            await browserManager.init();
-            browserManager.updateActivity();
-            
-            page = await browserManager.context.newPage();
-            await page.goto('https://weibo.com', { waitUntil: 'domcontentloaded', timeout: 20000 });
-            
-            try {
-                await page.waitForSelector('textarea[placeholder="有什么新鲜事想分享给大家？"]', { timeout: 10000 });
-                browserManager.setLoggedIn(true);
-                logWithFlush('[登录检查] ✅ 用户已登录');
-                await browserManager.saveSessionNow();
-                return true;
-            } catch {
-                browserManager.setLoggedIn(false);
-                logWithFlush('[登录检查] ❌ 用户未登录');
-                return false;
-            }
-        } catch (error) {
-            lastError = error;
-            logErrorWithFlush(`[登录检查] 失败 (尝试 ${i + 1}):`, error.message);
-            if (i < maxRetries - 1) {
-                await new Promise(resolve => setTimeout(resolve, 2000));
-            }
-        } finally {
-            if (page && !page.isClosed()) {
-                await page.close().catch(() => {});
-            }
-        }
+async function saveSession(context) {
+    try {
+        const sessionData = await context.storageState();
+        await fs.writeJson(SESSION_FILE, sessionData);
+        log('[会话] 已保存');
+    } catch (error) {
+        logError('[会话] 保存失败:', error.message);
     }
-    
-    browserManager.setLoggedIn(false);
-    throw lastError || new Error('检查登录状态失败');
+}
+
+// ========================= 核心功能 =========================
+async function checkLoginStatus() {
+    return await browserManager.withBrowser(async (context) => {
+        const page = await context.newPage();
+        try {
+            await page.goto('https://weibo.com', { 
+                waitUntil: 'domcontentloaded', 
+                timeout: 20000 
+            });
+            
+            await page.waitForSelector(
+                'textarea[placeholder="有什么新鲜事想分享给大家？"]', 
+                { timeout: 10000 }
+            );
+            
+            await saveSession(context);
+            log('[登录检查] ✅ 已登录');
+            return true;
+        } catch {
+            log('[登录检查] ❌ 未登录');
+            return false;
+        } finally {
+            await page.close();
+        }
+    });
 }
 
 async function getQRCode() {
-    const maxRetries = 2;
-    let lastError;
-    
-    for (let i = 0; i < maxRetries; i++) {
+    return await browserManager.withBrowser(async (context) => {
+        const page = await context.newPage();
         try {
-            logWithFlush(`[二维码] 获取二维码 (尝试 ${i + 1}/${maxRetries})`);
-            await browserManager.init();
-            browserManager.updateActivity();
+            await page.goto(
+                'https://passport.weibo.com/sso/signin?entry=miniblog&source=miniblog',
+                { waitUntil: 'domcontentloaded', timeout: 20000 }
+            );
             
-            // 关闭旧的登录页面
-            await browserManager.closeLoginPage();
+            await page.waitForSelector('img[src*="qr.weibo.cn"]', { timeout: 10000 });
+            const qrCodeUrl = await page.getAttribute('img[src*="qr.weibo.cn"]', 'src');
             
-            browserManager.loginPage = await browserManager.context.newPage();
-            await browserManager.loginPage.goto('https://passport.weibo.com/sso/signin?entry=miniblog&source=miniblog', {
-                waitUntil: 'domcontentloaded', timeout: 20000
-            });
+            if (!qrCodeUrl) throw new Error('未找到二维码');
             
-            await browserManager.loginPage.waitForSelector('img[src*="qr.weibo.cn"]', { timeout: 10000 });
-            const qrCodeUrl = await browserManager.loginPage.getAttribute('img[src*="qr.weibo.cn"]', 'src');
-            
-            if (qrCodeUrl) {
-                logWithFlush('[二维码] ✅ 二维码获取成功');
-                return qrCodeUrl;
-            } else {
-                throw new Error('未找到二维码');
-            }
-        } catch (error) {
-            lastError = error;
-            logErrorWithFlush(`[二维码] 失败 (尝试 ${i + 1}):`, error.message);
-            
-            // 失败时清理登录页面
-            await browserManager.closeLoginPage();
-            
-            if (i < maxRetries - 1) {
-                await new Promise(resolve => setTimeout(resolve, 2000));
-            }
+            log('[二维码] ✅ 获取成功');
+            return qrCodeUrl;
+        } finally {
+            await page.close();
         }
-    }
-    
-    throw lastError || new Error('获取二维码失败');
+    }, false);
 }
 
 async function checkScanStatus() {
-    try {
-        if (browserManager.isLoggedIn) {
-            return { status: 'success', message: '登录成功（已缓存）' };
-        }
-
-        if (!browserManager.loginPage || browserManager.loginPage.isClosed()) {
-            return { status: 'waiting', message: '页面已关闭，请重新获取二维码' };
-        }
-
-        browserManager.updateActivity();
-        await browserManager.loginPage.waitForLoadState('domcontentloaded', { timeout: 5000 }).catch(() => {});
-        const currentUrl = browserManager.loginPage.url();
-        
-        if (currentUrl.includes('weibo.com') && !currentUrl.includes('passport')) {
-            browserManager.setLoggedIn(true);
-            logWithFlush('[扫码状态] ✅ 用户扫码登录成功！');
-            await browserManager.saveSessionNow();
-            await browserManager.closeLoginPage();
-            return { status: 'success', message: '登录成功' };
-        }
-
-        const errorElement = await browserManager.loginPage.$('.txt_red').catch(() => null);
-        if (errorElement) {
-            const errorText = await errorElement.textContent();
-            await browserManager.closeLoginPage();
-            return { status: 'error', message: errorText };
-        }
-
-        const expiredElement = await browserManager.loginPage.$('text=二维码已失效').catch(() => null);
-        if (expiredElement) {
-            await browserManager.closeLoginPage();
-            return { status: 'error', message: '二维码已过期，请刷新' };
-        }
-
-        const statusElements = await browserManager.loginPage.$$('.txt').catch(() => []);
-        let statusMessage = '等待扫码';
-        for (const element of statusElements) {
-            const text = await element.textContent().catch(() => '');
-            if (text.includes('扫描成功') || text.includes('请确认')) {
-                statusMessage = '扫描成功，请在手机上确认登录';
-                break;
+    return await browserManager.withBrowser(async (context) => {
+        const page = await context.newPage();
+        try {
+            await page.goto(
+                'https://passport.weibo.com/sso/signin?entry=miniblog&source=miniblog',
+                { waitUntil: 'domcontentloaded', timeout: 20000 }
+            );
+            
+            const currentUrl = page.url();
+            if (currentUrl.includes('weibo.com') && !currentUrl.includes('passport')) {
+                await saveSession(context);
+                log('[扫码] ✅ 登录成功');
+                return { status: 'success', message: '登录成功' };
             }
+
+            const errorText = await page.$eval('.txt_red', el => el.textContent).catch(() => null);
+            if (errorText) {
+                return { status: 'error', message: errorText };
+            }
+
+            const expired = await page.$('text=二维码已失效').catch(() => null);
+            if (expired) {
+                return { status: 'error', message: '二维码已过期' };
+            }
+
+            const statusTexts = await page.$$eval('.txt', els => 
+                els.map(el => el.textContent)
+            ).catch(() => []);
+            
+            const isScanned = statusTexts.some(text => 
+                text.includes('扫描成功') || text.includes('请确认')
+            );
+            
+            return {
+                status: 'waiting',
+                message: isScanned ? '请在手机上确认' : '等待扫码'
+            };
+        } finally {
+            await page.close();
         }
-        return { status: 'waiting', message: statusMessage };
-    } catch (error) {
-        logErrorWithFlush('[扫码状态] 失败:', error.message);
-        await browserManager.closeLoginPage();
-        return { status: 'error', message: '检查状态失败: ' + error.message };
-    }
+    }, false);
 }
 
 async function postWeibo(content) {
-    const maxRetries = 2;
-    let lastError;
-    
-    for (let i = 0; i < maxRetries; i++) {
-        let page = null;
+    return await browserManager.withBrowser(async (context) => {
+        const page = await context.newPage();
         try {
-            logWithFlush(`[发送微博] 开始发送 (尝试 ${i + 1}/${maxRetries})`);
+            await page.goto('https://weibo.com', { 
+                waitUntil: 'domcontentloaded', 
+                timeout: 20000 
+            });
             
-            if (!browserManager.isLoggedIn) throw new Error('用户未登录');
-            await browserManager.init();
-            browserManager.updateActivity();
+            await page.waitForSelector(
+                'textarea[placeholder="有什么新鲜事想分享给大家？"]',
+                { timeout: 10000 }
+            );
             
-            page = await browserManager.context.newPage();
-            await page.goto('https://weibo.com', { waitUntil: 'domcontentloaded', timeout: 20000 });
-            await page.waitForSelector('textarea[placeholder="有什么新鲜事想分享给大家？"]', { timeout: 10000 });
-            await page.fill('textarea[placeholder="有什么新鲜事想分享给大家？"]', content);
-            await page.waitForSelector('button:has-text("发送"):not([disabled])', { timeout: 10000 });
+            await page.fill(
+                'textarea[placeholder="有什么新鲜事想分享给大家？"]',
+                content
+            );
+            
+            await page.waitForSelector(
+                'button:has-text("发送"):not([disabled])',
+                { timeout: 10000 }
+            );
 
             const [response] = await Promise.all([
-                page.waitForResponse(res => res.url().includes('/ajax/statuses/update') && res.status() === 200, { timeout: 15000 }),
-                page.click('button:has-text("发送")'),
+                page.waitForResponse(
+                    res => res.url().includes('/ajax/statuses/update') && res.status() === 200,
+                    { timeout: 15000 }
+                ),
+                page.click('button:has-text("发送")')
             ]);
 
             const result = await response.json();
-            if (result.ok === 1) {
-                logWithFlush('[发送微博] ✅ 发送成功!');
-                await browserManager.saveSessionNow();
-                await browserManager.refreshContextIfNeeded();
-                return {
-                    success: true, message: '微博发送成功',
-                    weiboId: result.data?.idstr, content: result.data?.text_raw || content,
-                };
-            } else {
-                throw new Error(`接口返回失败: ${result.msg || '未知错误'}`);
+            
+            if (result.ok !== 1) {
+                throw new Error(result.msg || '发送失败');
             }
-        } catch (error) {
-            lastError = error;
-            logErrorWithFlush(`[发送微博] 失败 (尝试 ${i + 1}):`, error.message);
-            if (i < maxRetries - 1) {
-                await new Promise(resolve => setTimeout(resolve, 3000));
-            }
+
+            await saveSession(context);
+            log('[发送微博] ✅ 成功');
+            
+            return {
+                success: true,
+                message: '发送成功',
+                weiboId: result.data?.idstr,
+                content: result.data?.text_raw || content
+            };
         } finally {
-            if (page && !page.isClosed()) {
-                await page.close().catch(() => {});
-            }
+            await page.close();
         }
-    }
-    
-    throw lastError || new Error('发送微博失败');
+    });
 }
 
 // ========================= API 路由（使用队列） =========================
 app.get('/api/status', async (req, res) => {
     try {
-        const loginStatus = await requestQueue.enqueue(
+        const isLoggedIn = await requestQueue.enqueue(
             () => checkLoginStatus(),
             'checkLoginStatus'
         );
-        res.json({ isLoggedIn: loginStatus });
+        res.json({ isLoggedIn });
     } catch (error) {
-        logErrorWithFlush('[API] 状态检查错误:', error);
+        logError('[API] 状态检查失败:', error.message);
         res.status(500).json({ error: error.message });
     }
 });
@@ -521,7 +385,7 @@ app.get('/api/qrcode', async (req, res) => {
         );
         res.json({ qrCodeUrl });
     } catch (error) {
-        logErrorWithFlush('[API] 二维码错误:', error);
+        logError('[API] 二维码获取失败:', error.message);
         res.status(500).json({ error: error.message });
     }
 });
@@ -534,7 +398,7 @@ app.get('/api/scan-status', async (req, res) => {
         );
         res.json(status);
     } catch (error) {
-        logErrorWithFlush('[API] 扫码状态错误:', error);
+        logError('[API] 扫码状态检查失败:', error.message);
         res.status(500).json({ error: error.message });
     }
 });
@@ -542,8 +406,13 @@ app.get('/api/scan-status', async (req, res) => {
 app.post('/api/post', async (req, res) => {
     try {
         const { content } = req.body;
-        if (!content || typeof content !== 'string' || content.length > 2000) {
-            return res.status(400).json({ error: '内容无效或过长' });
+        
+        if (!content || typeof content !== 'string') {
+            return res.status(400).json({ error: '内容无效' });
+        }
+        
+        if (content.length > 2000) {
+            return res.status(400).json({ error: '内容过长' });
         }
         
         const result = await requestQueue.enqueue(
@@ -552,7 +421,7 @@ app.post('/api/post', async (req, res) => {
         );
         res.json(result);
     } catch (error) {
-        logErrorWithFlush('[API] 发送微博错误:', error.message);
+        logError('[API] 发送失败:', error.message);
         res.status(500).json({ error: error.message });
     }
 });
@@ -560,89 +429,65 @@ app.post('/api/post', async (req, res) => {
 app.post('/api/logout', async (req, res) => {
     try {
         await requestQueue.enqueue(async () => {
-            logWithFlush('[API] 收到退出登录请求');
             if (await fs.pathExists(SESSION_FILE)) {
                 await fs.remove(SESSION_FILE);
             }
-            browserManager.setLoggedIn(false);
-            await browserManager.cleanup(false);
+            log('[API] 退出登录成功');
         }, 'logout');
         
-        res.json({ success: true, message: '退出登录成功' });
+        res.json({ success: true, message: '退出成功' });
     } catch (error) {
-        logErrorWithFlush('[API] 退出登录错误:', error);
+        logError('[API] 退出失败:', error.message);
         res.status(500).json({ error: error.message });
     }
 });
 
 app.get('/health', (req, res) => {
-  const mem = process.memoryUsage();
-  const queueStatus = requestQueue.getStatus();
-  const healthInfo = {
-    status: 'ok',
-    timestamp: new Date().toISOString(),
-    isLoggedIn: browserManager.isLoggedIn,
-    browserStatus: browserManager.browser ? 'running' : 'stopped',
-    contextStatus: browserManager.context ? 'active' : 'closed',
-    lastActivity: new Date(browserManager.lastActivity).toISOString(),
-    operationCount: browserManager.operationCount,
-    memory: {
-      rss: mem.rss,
-      heapTotal: mem.heapTotal,
-      heapUsed: mem.heapUsed,
-      external: mem.external
-    },
-    queue: queueStatus
-  };
-  res.json(healthInfo);
+    const memInfo = memoryMonitor.getMemoryInfo();
+    const queueStatus = requestQueue.getStatus();
+    res.json({
+        status: 'ok',
+        timestamp: new Date().toISOString(),
+        memory: memInfo,
+        queue: queueStatus,
+        browserStatus: browserManager.browser ? 'running' : 'stopped'
+    });
 });
 
+// ========================= 错误处理 =========================
 app.use((err, req, res, next) => {
-    logErrorWithFlush('[错误处理]:', err.message);
-    if (err instanceof SyntaxError && err.status === 400 && 'body' in err) {
-        return res.status(400).json({ error: '请求体JSON格式错误' });
-    }
-    res.status(500).json({ error: '服务器内部错误' });
+    logError('[错误]:', err.message);
+    res.status(500).json({ error: '服务器错误' });
 });
 
 // ========================= 优雅关闭 =========================
 async function gracefulShutdown(signal) {
-    logWithFlush(`[关闭] 收到 ${signal} 信号`);
+    log(`[关闭] 收到 ${signal} 信号`);
     
-    // 等待队列清空（最多等待30秒）
+    // 等待队列清空（最多30秒）
     const maxWait = 30000;
     const startTime = Date.now();
     while (requestQueue.processing && (Date.now() - startTime) < maxWait) {
-        logWithFlush(`[关闭] 等待队列完成: ${requestQueue.getStatus().currentOperation}`);
+        log('[关闭] 等待队列完成...');
         await new Promise(resolve => setTimeout(resolve, 1000));
     }
     
-    if (requestQueue.processing) {
-        logWithFlush('[关闭] ⚠️ 队列任务超时，强制退出');
-    }
-    
-    try {
-        // 尝试最后保存一次session
-        await browserManager.saveSessionNow();
-        await browserManager.cleanup(true);
-        logWithFlush('[关闭] 资源清理完成');
-    } catch (error) {
-        logErrorWithFlush('[关闭] 清理错误:', error.message);
-    }
+    await browserManager.close();
     process.exit(0);
 }
 
 process.on('SIGINT', () => gracefulShutdown('SIGINT'));
 process.on('SIGTERM', () => gracefulShutdown('SIGTERM'));
-
 process.on('unhandledRejection', (reason) => {
-    logErrorWithFlush('[Promise拒绝]:', reason);
+    logError('[Promise拒绝]:', reason);
 });
 
+// ========================= 启动服务 =========================
 app.listen(PORT, () => {
-    logWithFlush(`[启动] 🚀 服务器运行在端口 ${PORT}`);
-    logWithFlush(`[启动] 🌐 访问: http://localhost:${PORT}`);
-    logWithFlush(`[启动] ❤️ 健康检查: http://localhost:${PORT}/health`);
-    logWithFlush(`[启动] 🔄 请求队列已启用，自动处理并发冲突`);
-    logWithFlush(`[启动] ♻️ Context 自动刷新阈值: ${browserManager.contextRefreshThreshold} 次操作`);
+    log(`[启动] 🚀 服务运行在端口 ${PORT}`);
+    log(`[启动] 🌐 访问: http://localhost:${PORT}`);
+    log(`[启动] ❤️  健康检查: http://localhost:${PORT}/health`);
+    log(`[启动] 📊 内存监控: 每分钟记录一次`);
+    log(`[启动] ♻️  浏览器策略: 按需启动，用完即退`);
+    log(`[启动] 🔄 请求队列: 已启用，防止并发冲突`);
 });
