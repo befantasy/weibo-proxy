@@ -46,17 +46,24 @@ function logMemoryUsage(context = '') {
 }
 
 function performGC(context = '') {
-    if (global.gc) {
+    if (typeof global.gc === 'function') {
         try {
-            logWithFlush(`[GC${context ? ' - ' + context : ''}] 执行垃圾回收...`);
             const before = process.memoryUsage();
+            const beforeHeap = Math.round(before.heapUsed / 1024 / 1024);
+            
+            logWithFlush(`[GC${context ? ' - ' + context : ''}] 执行垃圾回收...`);
             global.gc();
+            
             const after = process.memoryUsage();
-            const freed = Math.round((before.heapUsed - after.heapUsed) / 1024 / 1024);
-            logWithFlush(`[GC${context ? ' - ' + context : ''}] 完成，释放: ${freed}MB`);
+            const afterHeap = Math.round(after.heapUsed / 1024 / 1024);
+            const freed = beforeHeap - afterHeap;
+            
+            logWithFlush(`[GC${context ? ' - ' + context : ''}] 完成 - 释放: ${freed}MB (${beforeHeap}MB -> ${afterHeap}MB)`);
         } catch (error) {
-            logErrorWithFlush(`[GC] 执行失败:`, error.message);
+            logErrorWithFlush(`[GC${context ? ' - ' + context : ''}] 执行失败:`, error.message);
         }
+    } else {
+        logWithFlush(`[GC${context ? ' - ' + context : ''}] 跳过 - GC 未启用`);
     }
 }
 
@@ -96,9 +103,17 @@ class RequestQueue {
 
         try {
             logWithFlush(`[队列] 开始执行: ${task.operationName} (等待时间: ${Date.now() - task.timestamp}ms)`);
+            logMemoryUsage(`执行前 - ${task.operationName}`);
+            
             const result = await task.operation();
             task.resolve(result);
+            
             logWithFlush(`[队列] 执行成功: ${task.operationName}`);
+            logMemoryUsage(`执行后 - ${task.operationName}`);
+            
+            // 每次操作后主动进行垃圾回收
+            performGC(task.operationName);
+            
         } catch (error) {
             logErrorWithFlush(`[队列] 执行失败: ${task.operationName}`, error.message);
             task.reject(error);
@@ -241,16 +256,17 @@ class BrowserManager {
                 return;
             }
 
+            // 定期记录内存状态
+            logMemoryUsage('定期检查');
+
             // 空闲时关闭浏览器和上下文以释放内存
             if (idleTime > this.idleTimeout && (this.context || this.browser)) {
                 logWithFlush(`[清理] 检测到空闲 ${Math.round(idleTime/1000)}s，关闭浏览器释放内存`);
                 await this.cleanup(true);
                 
-                // 手动触发垃圾回收（如果可用）
-                if (global.gc) {
-                    logWithFlush('[清理] 触发垃圾回收');
-                    global.gc();
-                }
+                // 手动触发垃圾回收
+                performGC('空闲清理');
+                logMemoryUsage('清理后');
             }
         }, 30000); // 每30秒检查一次
     }
@@ -646,10 +662,33 @@ app.get('/health', (req, res) => {
         memory: {
             heapUsed: `${Math.round(memUsage.heapUsed / 1024 / 1024)}MB`,
             heapTotal: `${Math.round(memUsage.heapTotal / 1024 / 1024)}MB`,
-            rss: `${Math.round(memUsage.rss / 1024 / 1024)}MB`
+            rss: `${Math.round(memUsage.rss / 1024 / 1024)}MB`,
+            external: `${Math.round(memUsage.external / 1024 / 1024)}MB`
+        },
+        gc: {
+            available: typeof global.gc === 'function'
         }
     };
+    
+    // 同时在日志中输出
+    logMemoryUsage('健康检查');
+    
     res.json(healthInfo);
+});
+
+// 添加测试端点用于验证内存监控
+app.get('/api/test-memory', authenticateToken, (req, res) => {
+    logWithFlush('[测试] 手动触发内存监控和GC测试');
+    logMemoryUsage('测试 - GC前');
+    performGC('手动测试');
+    setTimeout(() => {
+        logMemoryUsage('测试 - GC后');
+        res.json({ 
+            success: true, 
+            message: '内存监控测试完成，请查看日志',
+            gcAvailable: typeof global.gc === 'function'
+        });
+    }, 100);
 });
 
 app.use((err, req, res, next) => {
@@ -694,4 +733,17 @@ app.listen(PORT, () => {
     logWithFlush(`[启动] ❤️ 健康检查: http://localhost:${PORT}/health`);
     logWithFlush(`[启动] 🔄 请求队列已启用，自动处理并发冲突`);
     logWithFlush(`[启动] 💾 内存优化模式：空闲2分钟后自动关闭浏览器`);
+    
+    // 检查 GC 是否可用
+    const gcAvailable = typeof global.gc === 'function';
+    logWithFlush(`[启动] 🧹 垃圾回收 GC: ${gcAvailable ? '✅ 已启用 (每次操作后自动清理)' : '❌ 未启用 (需要 --expose-gc 参数)'}`);
+    
+    if (!gcAvailable) {
+        logWithFlush(`[启动] ⚠️ 提示: 请在启动命令中添加 --expose-gc 参数以启用手动垃圾回收`);
+    }
+    
+    // 启动时记录初始内存状态
+    setTimeout(() => {
+        logMemoryUsage('启动完成');
+    }, 1000);
 });
