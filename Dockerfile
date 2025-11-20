@@ -31,7 +31,7 @@ USER pwuser
 EXPOSE 3000
 
 # 设置内存限制环境变量
-ENV NODE_OPTIONS="--max-old-space-size=500"
+ENV NODE_OPTIONS="--max-old-space-size=400 --expose-gc"
 
 # 启动应用
 CMD ["node", "server.js"]
