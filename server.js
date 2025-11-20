@@ -18,6 +18,48 @@ function logErrorWithFlush(...args) {
     if (process.stderr.write) process.stderr.write('');
 }
 
+// ========================= 内存监控 =========================
+function logMemoryUsage(context = '') {
+    const memUsage = process.memoryUsage();
+    const formatMB = (bytes) => Math.round(bytes / 1024 / 1024);
+    
+    logWithFlush(
+        `[内存监控${context ? ' - ' + context : ''}] ` +
+        `堆使用: ${formatMB(memUsage.heapUsed)}MB / ${formatMB(memUsage.heapTotal)}MB | ` +
+        `RSS: ${formatMB(memUsage.rss)}MB | ` +
+        `外部: ${formatMB(memUsage.external)}MB`
+    );
+    
+    // 内存告警
+    const heapUsedMB = formatMB(memUsage.heapUsed);
+    const rssMB = formatMB(memUsage.rss);
+    
+    if (rssMB > 400) {
+        logErrorWithFlush(`⚠️ [内存告警] RSS内存使用过高: ${rssMB}MB (>400MB)`);
+    } else if (rssMB > 350) {
+        logWithFlush(`⚠️ [内存警告] RSS内存接近限制: ${rssMB}MB`);
+    }
+    
+    if (heapUsedMB > 300) {
+        logErrorWithFlush(`⚠️ [内存告警] 堆内存使用过高: ${heapUsedMB}MB (>300MB)`);
+    }
+}
+
+function performGC(context = '') {
+    if (global.gc) {
+        try {
+            logWithFlush(`[GC${context ? ' - ' + context : ''}] 执行垃圾回收...`);
+            const before = process.memoryUsage();
+            global.gc();
+            const after = process.memoryUsage();
+            const freed = Math.round((before.heapUsed - after.heapUsed) / 1024 / 1024);
+            logWithFlush(`[GC${context ? ' - ' + context : ''}] 完成，释放: ${freed}MB`);
+        } catch (error) {
+            logErrorWithFlush(`[GC] 执行失败:`, error.message);
+        }
+    }
+}
+
 // ========================= 请求队列管理器 =========================
 class RequestQueue {
     constructor() {
@@ -88,7 +130,7 @@ class BrowserManager {
         this.browser = null;
         this.context = null;
         this.lastActivity = Date.now();
-        this.idleTimeout = 3 * 60 * 1000; // 减少到3分钟
+        this.idleTimeout = 2 * 60 * 1000; // 2分钟空闲后关闭
         this.cleanupInterval = null;
         this.isInitializing = false;
     }
@@ -651,5 +693,5 @@ app.listen(PORT, () => {
     logWithFlush(`[启动] 🌐 访问: http://localhost:${PORT}`);
     logWithFlush(`[启动] ❤️ 健康检查: http://localhost:${PORT}/health`);
     logWithFlush(`[启动] 🔄 请求队列已启用，自动处理并发冲突`);
-    logWithFlush(`[启动] 💾 内存优化模式：空闲5分钟后自动关闭浏览器`);
+    logWithFlush(`[启动] 💾 内存优化模式：空闲2分钟后自动关闭浏览器`);
 });
