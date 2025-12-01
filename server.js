@@ -1,5 +1,12 @@
 require('dotenv').config();
 const AUTH_TOKEN = process.env.AUTH_TOKEN || 'weibo-proxy';
+// ========================= Cloudflare KV 配置 =========================
+const CF_ACCOUNT_ID = process.env.CLOUDFLARE_ACCOUNT_ID;
+const CF_NAMESPACE_ID = process.env.CLOUDFLARE_NAMESPACE_ID;
+const CF_API_TOKEN = process.env.CLOUDFLARE_API_TOKEN;
+const CF_SESSION_KEY = 'weibo-session';
+const USE_CLOUDFLARE_KV = CF_ACCOUNT_ID && CF_NAMESPACE_ID && CF_API_TOKEN;
+
 const express = require('express');
 const cors = require('cors');
 const fs = require('fs-extra');
@@ -16,6 +23,91 @@ function logWithFlush(...args) {
 function logErrorWithFlush(...args) {
     console.error(...args);
     if (process.stderr.write) process.stderr.write('');
+}
+
+// ========================= Cloudflare KV 操作函数 =========================
+async function saveSessionToCloudflare(sessionData) {
+    if (!USE_CLOUDFLARE_KV) return false;
+    
+    try {
+        const url = `https://api.cloudflare.com/client/v4/accounts/${CF_ACCOUNT_ID}/storage/kv/namespaces/${CF_NAMESPACE_ID}/values/${CF_SESSION_KEY}`;
+        const response = await fetch(url, {
+            method: 'PUT',
+            headers: {
+                'Authorization': `Bearer ${CF_API_TOKEN}`,
+                'Content-Type': 'application/json'
+            },
+            body: JSON.stringify(sessionData)
+        });
+        
+        if (response.ok) {
+            logWithFlush('[Cloudflare KV] 会话已保存到云端');
+            return true;
+        } else {
+            const error = await response.text();
+            logErrorWithFlush('[Cloudflare KV] 保存失败:', error);
+            return false;
+        }
+    } catch (error) {
+        logErrorWithFlush('[Cloudflare KV] 保存异常:', error.message);
+        return false;
+    }
+}
+
+async function loadSessionFromCloudflare() {
+    if (!USE_CLOUDFLARE_KV) return null;
+    
+    try {
+        const url = `https://api.cloudflare.com/client/v4/accounts/${CF_ACCOUNT_ID}/storage/kv/namespaces/${CF_NAMESPACE_ID}/values/${CF_SESSION_KEY}`;
+        const response = await fetch(url, {
+            method: 'GET',
+            headers: {
+                'Authorization': `Bearer ${CF_API_TOKEN}`
+            }
+        });
+        
+        if (response.ok) {
+            const sessionData = await response.json();
+            logWithFlush('[Cloudflare KV] 会话已从云端加载');
+            return sessionData;
+        } else if (response.status === 404) {
+            logWithFlush('[Cloudflare KV] 云端无会话数据');
+            return null;
+        } else {
+            const error = await response.text();
+            logErrorWithFlush('[Cloudflare KV] 加载失败:', error);
+            return null;
+        }
+    } catch (error) {
+        logErrorWithFlush('[Cloudflare KV] 加载异常:', error.message);
+        return null;
+    }
+}
+
+async function deleteSessionFromCloudflare() {
+    if (!USE_CLOUDFLARE_KV) return false;
+    
+    try {
+        const url = `https://api.cloudflare.com/client/v4/accounts/${CF_ACCOUNT_ID}/storage/kv/namespaces/${CF_NAMESPACE_ID}/values/${CF_SESSION_KEY}`;
+        const response = await fetch(url, {
+            method: 'DELETE',
+            headers: {
+                'Authorization': `Bearer ${CF_API_TOKEN}`
+            }
+        });
+        
+        if (response.ok) {
+            logWithFlush('[Cloudflare KV] 会话已从云端删除');
+            return true;
+        } else {
+            const error = await response.text();
+            logErrorWithFlush('[Cloudflare KV] 删除失败:', error);
+            return false;
+        }
+    } catch (error) {
+        logErrorWithFlush('[Cloudflare KV] 删除异常:', error.message);
+        return false;
+    }
 }
 
 // ========================= 内存监控 =========================
@@ -288,8 +380,15 @@ class BrowserManager {
         if (this.context && isLoggedIn) {
             try {
                 const sessionData = await this.context.storageState();
-                await fs.writeJson(SESSION_FILE, sessionData);
-                logWithFlush('[会话] 会话已保存');
+                
+                // 优先保存到 Cloudflare KV
+                if (USE_CLOUDFLARE_KV) {
+                    await saveSessionToCloudflare(sessionData);
+                } else {
+                    // 回退到本地文件
+                    await fs.writeJson(SESSION_FILE, sessionData);
+                    logWithFlush('[会话] 会话已保存');
+                }
                 return true;
             } catch (error) {
                 if (!error.message.includes('closed')) {
@@ -352,6 +451,15 @@ async function initBrowser() {
 
 async function loadSession() {
     try {
+        // 优先从 Cloudflare KV 加载
+        if (USE_CLOUDFLARE_KV) {
+            const sessionData = await loadSessionFromCloudflare();
+            if (sessionData) {
+                return sessionData;
+            }
+        }
+        
+        // 回退到本地文件
         if (await fs.pathExists(SESSION_FILE)) {
             const sessionData = await fs.readJson(SESSION_FILE);
             logWithFlush('[会话] 会话文件已加载');
@@ -627,9 +735,17 @@ app.post('/api/logout', async (req, res) => {
     try {
         await requestQueue.enqueue(async () => {
             logWithFlush('[API] 收到退出登录请求');
+            
+            // 删除 Cloudflare KV 中的会话
+            if (USE_CLOUDFLARE_KV) {
+                await deleteSessionFromCloudflare();
+            }
+            
+            // 删除本地会话文件
             if (await fs.pathExists(SESSION_FILE)) {
                 await fs.remove(SESSION_FILE);
             }
+            
             isLoggedIn = false;
             
             if (loginPage && !loginPage.isClosed()) {
@@ -658,6 +774,7 @@ app.get('/health', (req, res) => {
         browserStatus: browser ? 'running' : 'stopped',
         contextStatus: context ? 'active' : 'closed',
         lastActivity: new Date(lastActivityTime).toISOString(),
+        storage: USE_CLOUDFLARE_KV ? 'Cloudflare KV' : 'Local File',
         queue: queueStatus,
         memory: {
             heapUsed: `${Math.round(memUsage.heapUsed / 1024 / 1024)}MB`,
@@ -733,6 +850,14 @@ app.listen(PORT, () => {
     logWithFlush(`[启动] ❤️ 健康检查: http://localhost:${PORT}/health`);
     logWithFlush(`[启动] 🔄 请求队列已启用，自动处理并发冲突`);
     logWithFlush(`[启动] 💾 内存优化模式：空闲2分钟后自动关闭浏览器`);
+    
+    // 显示存储模式
+    if (USE_CLOUDFLARE_KV) {
+        logWithFlush(`[启动] ☁️ 会话存储: Cloudflare KV (云端持久化)`);
+    } else {
+        logWithFlush(`[启动] 📁 会话存储: 本地文件 (容器重启后丢失)`);
+        logWithFlush(`[启动] ⚠️ 提示: 配置 Cloudflare KV 环境变量以启用云端持久化`);
+    }
     
     // 检查 GC 是否可用
     const gcAvailable = typeof global.gc === 'function';
