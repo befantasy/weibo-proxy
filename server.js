@@ -487,11 +487,12 @@ async function checkLoginStatus() {
             
             try {
                 await page.waitForSelector('textarea[placeholder="有什么新鲜事想分享给大家？"]', { timeout: 10000 });
+                const wasLoggedIn = isLoggedIn;
                 isLoggedIn = true;
                 lastActivityTime = Date.now();
                 logWithFlush('[登录检查] ✅ 用户已登录');
-                // 只在登录状态改变时保存会话
-                if (!isLoggedIn) {
+                // 只在登录状态改变时保存会话（从未登录变为已登录）
+                if (!wasLoggedIn) {
                     await browserManager.saveSessionNow();
                 }
                 return true;
@@ -627,7 +628,15 @@ async function postWeibo(content) {
         try {
             logWithFlush(`[发送微博] 开始发送 (尝试 ${i + 1}/${maxRetries})`);
             
-            if (!isLoggedIn) throw new Error('用户未登录');
+            // 如果未登录，先尝试检查登录状态（可能从 Cloudflare KV 恢复了会话）
+            if (!isLoggedIn) {
+                logWithFlush('[发送微博] 检测到未登录状态，尝试恢复会话...');
+                await checkLoginStatus();
+                if (!isLoggedIn) {
+                    throw new Error('用户未登录');
+                }
+            }
+            
             await initBrowser();
             browserManager.updateActivity();
             
