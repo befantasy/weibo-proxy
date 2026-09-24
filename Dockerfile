@@ -7,13 +7,12 @@ WORKDIR /app
 # 复制package.json和package-lock.json（如果存在）
 COPY package.json ./
 
-# 设置npm镜像源（可选，用于加速安装）
+# 设置npm镜像源（加速安装）
 RUN npm config set registry https://registry.npmmirror.com
 
-# 生成package-lock.json（如果不存在）并安装依赖
+# 安装依赖并清理缓存
 RUN npm install --omit=dev && \
     rm -rf /tmp/* /var/tmp/* /root/.npm && \
-    # 清理 apt 缓存
     apt-get clean && \
     rm -rf /var/lib/apt/lists/*
 
@@ -30,8 +29,8 @@ USER pwuser
 # 暴露端口
 EXPOSE 3000
 
-# 设置内存限制环境变量
-ENV NODE_OPTIONS="--max-old-space-size=400 --expose-gc"
+# 设置内存限制环境变量（适配 Render 512MB 内存环境，Node 堆限制为 160MB）
+ENV NODE_OPTIONS="--max-old-space-size=160 --expose-gc"
 
 # 启动应用
 CMD ["node", "server.js"]

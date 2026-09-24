@@ -1,11 +1,21 @@
 require('dotenv').config();
 const AUTH_TOKEN = process.env.AUTH_TOKEN || 'weibo-proxy';
+
 // ========================= Cloudflare KV 配置 =========================
 const CF_ACCOUNT_ID = process.env.CLOUDFLARE_ACCOUNT_ID;
 const CF_NAMESPACE_ID = process.env.CLOUDFLARE_NAMESPACE_ID;
 const CF_API_TOKEN = process.env.CLOUDFLARE_API_TOKEN;
 const CF_SESSION_KEY = 'weibo-session';
-const USE_CLOUDFLARE_KV = CF_ACCOUNT_ID && CF_NAMESPACE_ID && CF_API_TOKEN;
+
+// 严格过滤掉默认模板占位符，避免在未配置时产生误判
+const USE_CLOUDFLARE_KV = Boolean(
+    CF_ACCOUNT_ID &&
+    CF_NAMESPACE_ID &&
+    CF_API_TOKEN &&
+    !CF_ACCOUNT_ID.includes('your_') &&
+    !CF_NAMESPACE_ID.includes('your_') &&
+    !CF_API_TOKEN.includes('your_')
+);
 
 const express = require('express');
 const cors = require('cors');
@@ -31,25 +41,30 @@ async function saveSessionToCloudflare(sessionData) {
     
     try {
         const url = `https://api.cloudflare.com/client/v4/accounts/${CF_ACCOUNT_ID}/storage/kv/namespaces/${CF_NAMESPACE_ID}/values/${CF_SESSION_KEY}`;
+        const controller = new AbortController();
+        const timeoutId = setTimeout(() => controller.abort(), 8000); // 8秒超时，防止挂起请求队列
+        
         const response = await fetch(url, {
             method: 'PUT',
             headers: {
                 'Authorization': `Bearer ${CF_API_TOKEN}`,
                 'Content-Type': 'application/json'
             },
-            body: JSON.stringify(sessionData)
+            body: JSON.stringify(sessionData),
+            signal: controller.signal
         });
+        clearTimeout(timeoutId);
         
         if (response.ok) {
-            logWithFlush('[Cloudflare KV] 会话已保存到云端');
+            logWithFlush('[Cloudflare KV] ✅ 会话已同步保存到云端');
             return true;
         } else {
             const error = await response.text();
-            logErrorWithFlush('[Cloudflare KV] 保存失败:', error);
+            logErrorWithFlush('[Cloudflare KV] ❌ 保存失败:', response.status, error);
             return false;
         }
     } catch (error) {
-        logErrorWithFlush('[Cloudflare KV] 保存异常:', error.message);
+        logErrorWithFlush('[Cloudflare KV] ❌ 保存异常:', error.message);
         return false;
     }
 }
@@ -59,27 +74,32 @@ async function loadSessionFromCloudflare() {
     
     try {
         const url = `https://api.cloudflare.com/client/v4/accounts/${CF_ACCOUNT_ID}/storage/kv/namespaces/${CF_NAMESPACE_ID}/values/${CF_SESSION_KEY}`;
+        const controller = new AbortController();
+        const timeoutId = setTimeout(() => controller.abort(), 8000);
+        
         const response = await fetch(url, {
             method: 'GET',
             headers: {
                 'Authorization': `Bearer ${CF_API_TOKEN}`
-            }
+            },
+            signal: controller.signal
         });
+        clearTimeout(timeoutId);
         
         if (response.ok) {
             const sessionData = await response.json();
-            logWithFlush('[Cloudflare KV] 会话已从云端加载');
+            logWithFlush('[Cloudflare KV] ✅ 会话已从云端加载');
             return sessionData;
         } else if (response.status === 404) {
-            logWithFlush('[Cloudflare KV] 云端无会话数据');
+            logWithFlush('[Cloudflare KV] 云端无会话数据 (404)');
             return null;
         } else {
             const error = await response.text();
-            logErrorWithFlush('[Cloudflare KV] 加载失败:', error);
+            logErrorWithFlush('[Cloudflare KV] ❌ 加载失败:', response.status, error);
             return null;
         }
     } catch (error) {
-        logErrorWithFlush('[Cloudflare KV] 加载异常:', error.message);
+        logErrorWithFlush('[Cloudflare KV] ❌ 加载异常:', error.message);
         return null;
     }
 }
@@ -89,23 +109,28 @@ async function deleteSessionFromCloudflare() {
     
     try {
         const url = `https://api.cloudflare.com/client/v4/accounts/${CF_ACCOUNT_ID}/storage/kv/namespaces/${CF_NAMESPACE_ID}/values/${CF_SESSION_KEY}`;
+        const controller = new AbortController();
+        const timeoutId = setTimeout(() => controller.abort(), 8000);
+        
         const response = await fetch(url, {
             method: 'DELETE',
             headers: {
                 'Authorization': `Bearer ${CF_API_TOKEN}`
-            }
+            },
+            signal: controller.signal
         });
+        clearTimeout(timeoutId);
         
         if (response.ok) {
-            logWithFlush('[Cloudflare KV] 会话已从云端删除');
+            logWithFlush('[Cloudflare KV] ✅ 会话已从云端删除');
             return true;
         } else {
             const error = await response.text();
-            logErrorWithFlush('[Cloudflare KV] 删除失败:', error);
+            logErrorWithFlush('[Cloudflare KV] ❌ 删除失败:', response.status, error);
             return false;
         }
     } catch (error) {
-        logErrorWithFlush('[Cloudflare KV] 删除异常:', error.message);
+        logErrorWithFlush('[Cloudflare KV] ❌ 删除异常:', error.message);
         return false;
     }
 }
@@ -122,18 +147,17 @@ function logMemoryUsage(context = '') {
         `外部: ${formatMB(memUsage.external)}MB`
     );
     
-    // 内存告警
     const heapUsedMB = formatMB(memUsage.heapUsed);
     const rssMB = formatMB(memUsage.rss);
     
-    if (rssMB > 400) {
-        logErrorWithFlush(`⚠️ [内存告警] RSS内存使用过高: ${rssMB}MB (>400MB)`);
+    if (rssMB > 420) {
+        logErrorWithFlush(`⚠️ [内存告警] RSS内存使用过高: ${rssMB}MB (>420MB，接近Render 512MB上限)`);
     } else if (rssMB > 350) {
         logWithFlush(`⚠️ [内存警告] RSS内存接近限制: ${rssMB}MB`);
     }
     
-    if (heapUsedMB > 300) {
-        logErrorWithFlush(`⚠️ [内存告警] 堆内存使用过高: ${heapUsedMB}MB (>300MB)`);
+    if (heapUsedMB > 140) {
+        logErrorWithFlush(`⚠️ [内存告警] 堆内存使用过高: ${heapUsedMB}MB (>140MB)`);
     }
 }
 
@@ -143,7 +167,6 @@ function performGC(context = '') {
             const before = process.memoryUsage();
             const beforeHeap = Math.round(before.heapUsed / 1024 / 1024);
             
-            logWithFlush(`[GC${context ? ' - ' + context : ''}] 执行垃圾回收...`);
             global.gc();
             
             const after = process.memoryUsage();
@@ -154,8 +177,6 @@ function performGC(context = '') {
         } catch (error) {
             logErrorWithFlush(`[GC${context ? ' - ' + context : ''}] 执行失败:`, error.message);
         }
-    } else {
-        logWithFlush(`[GC${context ? ' - ' + context : ''}] 跳过 - GC 未启用`);
     }
 }
 
@@ -203,7 +224,6 @@ class RequestQueue {
             logWithFlush(`[队列] 执行成功: ${task.operationName}`);
             logMemoryUsage(`执行后 - ${task.operationName}`);
             
-            // 每次操作后主动进行垃圾回收
             performGC(task.operationName);
             
         } catch (error) {
@@ -237,13 +257,12 @@ class BrowserManager {
         this.browser = null;
         this.context = null;
         this.lastActivity = Date.now();
-        this.idleTimeout = 2 * 60 * 1000; // 2分钟空闲后关闭
+        this.idleTimeout = 2 * 60 * 1000; // 2分钟空闲后关闭浏览器释放内存
         this.cleanupInterval = null;
         this.isInitializing = false;
     }
 
     async init() {
-        // 防止并发初始化
         if (this.isInitializing) {
             logWithFlush('[浏览器] 正在初始化中，等待完成...');
             while (this.isInitializing) {
@@ -252,43 +271,37 @@ class BrowserManager {
             return { browser: this.browser, context: this.context };
         }
 
-        if (this.browser && this.context) {
+        if (this.browser && this.browser.isConnected() && this.context) {
             this.updateActivity();
             return { browser: this.browser, context: this.context };
         }
 
         this.isInitializing = true;
         try {
-            if (!this.browser) {
-                logWithFlush('[浏览器] 启动浏览器...');
+            if (!this.browser || !this.browser.isConnected()) {
+                logWithFlush('[浏览器] 启动浏览器 (Render 低内存模式)...');
                 this.browser = await chromium.launch({
                     headless: true,
                     args: [
                         '--no-sandbox',
                         '--disable-setuid-sandbox',
                         '--disable-dev-shm-usage',
-                        '--disable-web-security',
                         '--disable-gpu',
                         '--disable-extensions',
+                        '--no-zygote',
+                        '--single-process', // 在极低内存容器下减少进程分裂
                         '--disable-background-timer-throttling',
                         '--disable-backgrounding-occluded-windows',
                         '--disable-renderer-backgrounding',
-                        '--max_old_space_size=256',
-                        '--disable-features=Translate,BackForwardCache,VizDisplayCompositor',
-                        '--js-flags=--max-old-space-size=256',
+                        '--renderer-process-limit=1',
+                        '--max_old_space_size=128',
+                        '--js-flags=--max-old-space-size=128',
+                        '--disable-features=Translate,BackForwardCache,VizDisplayCompositor'
                     ]
                 });
                 logWithFlush('[浏览器] 浏览器启动成功');
             }
 
-            if (this.context && this.browser.isConnected()) {
-                logWithFlush('[浏览器] 使用现有上下文');
-                this.updateActivity();
-                this.startCleanupTimer();
-                return { browser: this.browser, context: this.context };
-            }
-
-            // 清理旧上下文
             if (this.context) {
                 await this.context.close().catch(() => {});
                 this.context = null;
@@ -297,15 +310,30 @@ class BrowserManager {
             logWithFlush('[浏览器] 创建浏览器上下文...');
             const sessionData = await loadSession();
             const contextOptions = {
-                userAgent: 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36'
+                userAgent: 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
+                locale: 'zh-CN',
+                timezoneId: 'Asia/Shanghai'
             };
             if (sessionData) {
                 contextOptions.storageState = sessionData;
-                logWithFlush('[浏览器] 加载已保存的会话');
+                logWithFlush('[浏览器] 已加载持久化会话数据');
             }
             this.context = await this.browser.newContext(contextOptions);
-            logWithFlush('[浏览器] 上下文创建成功');
 
+            // 路由拦截：屏蔽消耗内存和流量的静态资源（保留微博二维码）
+            await this.context.route('**/*', (route) => {
+                const url = route.request().url();
+                const type = route.request().resourceType();
+                if (url.includes('qr.weibo.cn')) {
+                    return route.continue();
+                }
+                if (['image', 'media', 'font'].includes(type)) {
+                    return route.abort();
+                }
+                return route.continue();
+            });
+
+            logWithFlush('[浏览器] 上下文创建成功 (已启用资源过滤)');
             this.updateActivity();
             this.startCleanupTimer();
             
@@ -322,8 +350,13 @@ class BrowserManager {
     async cleanupContext() {
         if (this.context) {
             logWithFlush('[清理] 关闭浏览器上下文...');
+            // 在关闭上下文前，如果处于登录状态，保存最新凭据实现自动续期
+            if (isLoggedIn) {
+                await this.saveSessionNow().catch(() => {});
+            }
             await this.context.close().catch(() => {});
             this.context = null;
+            context = null; // 同步清空外部引用
             logWithFlush('[清理] 浏览器上下文已关闭');
         }
     }
@@ -333,6 +366,7 @@ class BrowserManager {
             logWithFlush('[清理] 关闭浏览器进程...');
             await this.browser.close().catch(() => {});
             this.browser = null;
+            browser = null; // 同步清空外部引用
             logWithFlush('[清理] 浏览器进程已关闭');
         }
     }
@@ -343,24 +377,19 @@ class BrowserManager {
         this.cleanupInterval = setInterval(async () => {
             const idleTime = Date.now() - this.lastActivity;
             
-            // 如果有任务在处理，不清理
             if (requestQueue.processing) {
                 return;
             }
 
-            // 定期记录内存状态
             logMemoryUsage('定期检查');
 
-            // 空闲时关闭浏览器和上下文以释放内存
             if (idleTime > this.idleTimeout && (this.context || this.browser)) {
                 logWithFlush(`[清理] 检测到空闲 ${Math.round(idleTime/1000)}s，关闭浏览器释放内存`);
                 await this.cleanup(true);
-                
-                // 手动触发垃圾回收
                 performGC('空闲清理');
                 logMemoryUsage('清理后');
             }
-        }, 30000); // 每30秒检查一次
+        }, 30000);
     }
 
     async cleanup(closeBrowser = true) {
@@ -377,27 +406,33 @@ class BrowserManager {
     }
 
     async saveSessionNow() {
-        if (this.context && isLoggedIn) {
-            try {
-                const sessionData = await this.context.storageState();
-                
-                // 优先保存到 Cloudflare KV
-                if (USE_CLOUDFLARE_KV) {
-                    await saveSessionToCloudflare(sessionData);
-                } else {
-                    // 回退到本地文件
-                    await fs.writeJson(SESSION_FILE, sessionData);
-                    logWithFlush('[会话] 会话已保存');
-                }
-                return true;
-            } catch (error) {
-                if (!error.message.includes('closed')) {
-                    logErrorWithFlush('[会话] 保存失败:', error.message);
-                }
+        if (!this.context) return false;
+        try {
+            const sessionData = await this.context.storageState();
+            if (!sessionData || !sessionData.cookies) {
                 return false;
             }
+
+            // 1. 优先保证本地文件写入（快速持久化）
+            try {
+                await fs.ensureDir(DATA_DIR);
+                await fs.writeJson(SESSION_FILE, sessionData);
+                logWithFlush('[会话] ✅ 本地会话文件已保存');
+            } catch (fsErr) {
+                logErrorWithFlush('[会话] 本地文件写入警告:', fsErr.message);
+            }
+            
+            // 2. 双写备份到 Cloudflare KV（适配 Render 免费版 Ephemeral 存储无盘特性）
+            if (USE_CLOUDFLARE_KV) {
+                await saveSessionToCloudflare(sessionData);
+            }
+            return true;
+        } catch (error) {
+            if (!error.message.includes('closed')) {
+                logErrorWithFlush('[会话] 保存失败:', error.message);
+            }
+            return false;
         }
-        return false;
     }
 }
 
@@ -406,12 +441,6 @@ const browserManager = new BrowserManager();
 // ========================= 应用配置 =========================
 app.use(cors());
 app.use(express.json({ limit: '50kb' }));
-app.use('/api', (req, res, next) => {
-    if (req.method !== 'GET' && req.get('Content-Type')?.includes('application/json') && req.body === undefined) {
-        return res.status(400).json({ error: '请求体JSON格式错误' });
-    }
-    next();
-});
 
 app.use('/api', (req, res, next) => {
     const queueStatus = requestQueue.getStatus();
@@ -449,73 +478,127 @@ async function initBrowser() {
     context = ctx;
 }
 
+// 登录会话加载（优先云端，回退本地）
 async function loadSession() {
     try {
-        // 优先从 Cloudflare KV 加载
         if (USE_CLOUDFLARE_KV) {
             const sessionData = await loadSessionFromCloudflare();
-            if (sessionData) {
+            if (sessionData && sessionData.cookies && sessionData.cookies.length > 0) {
+                await fs.writeJson(SESSION_FILE, sessionData).catch(() => {});
                 return sessionData;
             }
         }
         
-        // 回退到本地文件
         if (await fs.pathExists(SESSION_FILE)) {
             const sessionData = await fs.readJson(SESSION_FILE);
-            logWithFlush('[会话] 会话文件已加载');
-            return sessionData;
+            if (sessionData && sessionData.cookies && sessionData.cookies.length > 0) {
+                logWithFlush('[会话] ✅ 本地会话文件已加载');
+                return sessionData;
+            }
         }
     } catch (error) {
-        logWithFlush('[会话] 加载会话失败:', error.message);
+        logWithFlush('[会话] ❌ 加载会话失败:', error.message);
     }
     return null;
 }
 
+// 检查登录状态：采用轻量化接口优先，彻底避免在 0.1 CPU 上渲染整个 SPA 导致超时或 OOM
 async function checkLoginStatus() {
-    const maxRetries = 2;
-    let lastError;
-    
-    for (let i = 0; i < maxRetries; i++) {
+    logWithFlush('[登录检查] 开始检查登录状态...');
+    try {
+        await initBrowser();
+        browserManager.updateActivity();
+        
+        // 1. 快速检查上下文中是否存在核心凭据 SUB Cookie
+        const cookies = await context.cookies(['https://weibo.com']);
+        const sub = cookies.find(c => c.name === 'SUB' && c.value);
+        if (!sub) {
+            isLoggedIn = false;
+            logWithFlush('[登录检查] ❌ 上下文中无 SUB Cookie，判定未登录');
+            return false;
+        }
+
+        // 检查 SUB 是否已过期
+        if (sub.expires && sub.expires > 0 && sub.expires * 1000 < Date.now()) {
+            isLoggedIn = false;
+            logWithFlush('[登录检查] ❌ SUB Cookie 已过期，判定未登录');
+            return false;
+        }
+
+        // 2. 超轻量 API 校验：直接调用接口验证，耗时仅 ~200ms，内存几乎为 0
+        try {
+            const res = await context.request.get('https://weibo.com/ajax/profile/info', {
+                timeout: 10000,
+                headers: {
+                    'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
+                    'Referer': 'https://weibo.com/'
+                }
+            });
+
+            if (res.ok()) {
+                const data = await res.json().catch(() => null);
+                if (data && (data.ok === 1 || data.data?.user?.id)) {
+                    isLoggedIn = true;
+                    lastActivityTime = Date.now();
+                    logWithFlush(`[登录检查] ✅ 轻量接口校验成功！用户已登录 (UID: ${data.data?.user?.id || '已知'})`);
+                    // 每次验证成功均更新持久化存储，保证 Cookie 滑动续期
+                    await browserManager.saveSessionNow();
+                    return true;
+                } else if (data && data.ok === 0 && (data.message === 'not login' || data.login === 1)) {
+                    isLoggedIn = false;
+                    logWithFlush('[登录检查] ❌ 接口明确返回未登录状态');
+                    return false;
+                }
+            }
+        } catch (apiErr) {
+            logWithFlush('[登录检查] 轻量接口校验异常，回退至页面探测:', apiErr.message);
+        }
+
+        // 3. 页面回退检测：当轻量接口受阻时，安全开启页面检测
         let page = null;
         try {
-            logWithFlush(`[登录检查] 检查登录状态 (尝试 ${i + 1}/${maxRetries})`);
-            await initBrowser();
-            browserManager.updateActivity();
-            
             page = await context.newPage();
-            await page.goto('https://weibo.com', { waitUntil: 'domcontentloaded', timeout: 20000 });
-            
-            try {
-                await page.waitForSelector('textarea[placeholder="有什么新鲜事想分享给大家？"]', { timeout: 10000 });
-                const wasLoggedIn = isLoggedIn;
-                isLoggedIn = true;
-                lastActivityTime = Date.now();
-                logWithFlush('[登录检查] ✅ 用户已登录');
-                // 只在登录状态改变时保存会话（从未登录变为已登录）
-                if (!wasLoggedIn) {
-                    await browserManager.saveSessionNow();
-                }
-                return true;
-            } catch {
+            await page.goto('https://weibo.com', { waitUntil: 'domcontentloaded', timeout: 25000 });
+
+            const finalUrl = page.url();
+            if (finalUrl.includes('passport.weibo.com') || finalUrl.includes('login.php') || finalUrl.includes('newlogin')) {
                 isLoggedIn = false;
-                logWithFlush('[登录检查] ❌ 用户未登录');
+                logWithFlush('[登录检查] ❌ 页面被重定向至登录页');
                 return false;
             }
-        } catch (error) {
-            lastError = error;
-            logErrorWithFlush(`[登录检查] 失败 (尝试 ${i + 1}):`, error.message);
-            if (i < maxRetries - 1) {
-                await new Promise(resolve => setTimeout(resolve, 2000));
+
+            // 多元素组合匹配（支持各种改版、动态占位符、头像与导航栏）
+            const loggedInElement = await page.waitForSelector(
+                'textarea[placeholder*="新鲜事"], textarea[placeholder*="分享"], textarea.Form_input, [contenteditable="true"], [class*="woo-avatar"], [class*="gn_name"], a[href*="/u/"]',
+                { timeout: 12000 }
+            ).catch(() => null);
+
+            if (loggedInElement) {
+                isLoggedIn = true;
+                lastActivityTime = Date.now();
+                logWithFlush('[登录检查] ✅ 页面回退探测成功！用户已登录');
+                await browserManager.saveSessionNow();
+                return true;
             }
+
+            const loginBtn = await page.$('a:has-text("立即登录"), a:has-text("登录")').catch(() => null);
+            if (loginBtn) {
+                isLoggedIn = false;
+                logWithFlush('[登录检查] ❌ 检测到登录按钮，用户未登录');
+                return false;
+            }
+
+            logWithFlush('[登录检查] ⚠️ 页面状态不明确，保持现有登录状态:', isLoggedIn);
+            return isLoggedIn;
         } finally {
             if (page) {
                 await page.close().catch(() => {});
             }
         }
+    } catch (error) {
+        logErrorWithFlush('[登录检查] 检查异常:', error.message);
+        return isLoggedIn; // 遇网络抖动不轻易强制置否
     }
-    
-    isLoggedIn = false;
-    throw lastError || new Error('检查登录状态失败');
 }
 
 async function getQRCode() {
@@ -529,22 +612,22 @@ async function getQRCode() {
             browserManager.updateActivity();
             
             if (loginPage && !loginPage.isClosed()) {
-                await loginPage.close();
+                await loginPage.close().catch(() => {});
             }
             
             loginPage = await context.newPage();
             await loginPage.goto('https://passport.weibo.com/sso/signin?entry=miniblog&source=miniblog', {
-                waitUntil: 'domcontentloaded', timeout: 20000
+                waitUntil: 'domcontentloaded', timeout: 25000
             });
             
-            await loginPage.waitForSelector('img[src*="qr.weibo.cn"]', { timeout: 10000 });
+            await loginPage.waitForSelector('img[src*="qr.weibo.cn"]', { timeout: 15000 });
             const qrCodeUrl = await loginPage.getAttribute('img[src*="qr.weibo.cn"]', 'src');
             
             if (qrCodeUrl) {
                 logWithFlush('[二维码] ✅ 二维码获取成功');
                 return qrCodeUrl;
             } else {
-                throw new Error('未找到二维码');
+                throw new Error('未找到二维码图片元素');
             }
         } catch (error) {
             lastError = error;
@@ -573,17 +656,30 @@ async function checkScanStatus() {
         }
 
         browserManager.updateActivity();
-        await loginPage.waitForLoadState('domcontentloaded', { timeout: 5000 }).catch(() => {});
         const currentUrl = loginPage.url();
         
-        if (currentUrl.includes('weibo.com') && !currentUrl.includes('passport')) {
+        // 关键修复：检查上下文是否已收到 SUB 核心 Cookie
+        const cookies = await context.cookies(['https://weibo.com']);
+        const hasSub = cookies.some(c => c.name === 'SUB' && c.value);
+
+        // 必须在 weibo.com 域，且不处于 SSO 换票据阶段，且已获得 SUB Cookie，才认定登录完成
+        if (hasSub && currentUrl.includes('weibo.com') && !currentUrl.includes('passport') && !currentUrl.includes('sso/login')) {
             isLoggedIn = true;
             lastActivityTime = Date.now();
-            logWithFlush('[扫码状态] ✅ 用户扫码登录成功！');
+            logWithFlush('[扫码状态] ✅ 用户扫码登录成功，检测到有效凭证！');
+
+            // 等待 1 秒确保所有关联 Cookie 写入完毕
+            await loginPage.waitForTimeout(1000).catch(() => {});
             await browserManager.saveSessionNow();
+            
             await loginPage.close().catch(() => {});
             loginPage = null;
             return { status: 'success', message: '登录成功' };
+        }
+
+        // 正在登录跳转换取票据中
+        if (currentUrl.includes('sso/login') || currentUrl.includes('crossdomain')) {
+            return { status: 'waiting', message: '正在完成登录验证，请稍候...' };
         }
 
         const errorElement = await loginPage.$('.txt_red').catch(() => null);
@@ -611,10 +707,6 @@ async function checkScanStatus() {
         return { status: 'waiting', message: statusMessage };
     } catch (error) {
         logErrorWithFlush('[扫码状态] 失败:', error.message);
-        if (loginPage && !loginPage.isClosed()) {
-            await loginPage.close().catch(() => {});
-            loginPage = null;
-        }
         return { status: 'error', message: '检查状态失败: ' + error.message };
     }
 }
@@ -628,7 +720,6 @@ async function postWeibo(content) {
         try {
             logWithFlush(`[发送微博] 开始发送 (尝试 ${i + 1}/${maxRetries})`);
             
-            // 如果未登录，先尝试检查登录状态（可能从 Cloudflare KV 恢复了会话）
             if (!isLoggedIn) {
                 logWithFlush('[发送微博] 检测到未登录状态，尝试恢复会话...');
                 await checkLoginStatus();
@@ -641,21 +732,26 @@ async function postWeibo(content) {
             browserManager.updateActivity();
             
             page = await context.newPage();
-            await page.goto('https://weibo.com', { waitUntil: 'domcontentloaded', timeout: 20000 });
-            await page.waitForSelector('textarea[placeholder="有什么新鲜事想分享给大家？"]', { timeout: 10000 });
-            await page.fill('textarea[placeholder="有什么新鲜事想分享给大家？"]', content);
-            await page.waitForSelector('button:has-text("发送"):not([disabled])', { timeout: 10000 });
+            await page.goto('https://weibo.com', { waitUntil: 'domcontentloaded', timeout: 25000 });
+            
+            // 兼容多种动态占位符
+            const textareaSelector = 'textarea[placeholder*="新鲜事"], textarea[placeholder*="分享"], textarea.Form_input, textarea';
+            await page.waitForSelector(textareaSelector, { timeout: 15000 });
+            await page.fill(textareaSelector, content);
+            
+            const submitBtnSelector = 'button:has-text("发送"):not([disabled]), button[title*="发送"]:not([disabled])';
+            await page.waitForSelector(submitBtnSelector, { timeout: 15000 });
 
+            // 不再限定 res.status() === 200，以便在接口返回 400 等状态时能立即捕获微博后端的真实错误（如违规词、频控）
             const [response] = await Promise.all([
-                page.waitForResponse(res => res.url().includes('/ajax/statuses/update') && res.status() === 200, { timeout: 15000 }),
-                page.click('button:has-text("发送")'),
+                page.waitForResponse(res => res.url().includes('/ajax/statuses/update'), { timeout: 20000 }),
+                page.click(submitBtnSelector),
             ]);
 
             const result = await response.json();
             if (result.ok === 1) {
                 lastActivityTime = Date.now();
                 logWithFlush('[发送微博] ✅ 发送成功!');
-                // 发送成功后保存会话
                 await browserManager.saveSessionNow();
                 return {
                     success: true, 
@@ -664,7 +760,7 @@ async function postWeibo(content) {
                     content: result.data?.text_raw || content,
                 };
             } else {
-                throw new Error(`接口返回失败: ${result.msg || '未知错误'}`);
+                throw new Error(`接口返回失败: ${result.msg || result.message || '未知错误'}`);
             }
         } catch (error) {
             lastError = error;
@@ -682,7 +778,7 @@ async function postWeibo(content) {
     throw lastError || new Error('发送微博失败');
 }
 
-// ========================= API 路由（使用队列） =========================
+// ========================= API 路由 =========================
 app.get('/api/status', async (req, res) => {
     try {
         const loginStatus = await requestQueue.enqueue(
@@ -745,12 +841,10 @@ app.post('/api/logout', async (req, res) => {
         await requestQueue.enqueue(async () => {
             logWithFlush('[API] 收到退出登录请求');
             
-            // 删除 Cloudflare KV 中的会话
             if (USE_CLOUDFLARE_KV) {
                 await deleteSessionFromCloudflare();
             }
             
-            // 删除本地会话文件
             if (await fs.pathExists(SESSION_FILE)) {
                 await fs.remove(SESSION_FILE);
             }
@@ -762,7 +856,6 @@ app.post('/api/logout', async (req, res) => {
                 loginPage = null;
             }
 
-            // 退出登录时完全关闭浏览器
             await browserManager.cleanup(true);
         }, 'logout');
         
@@ -780,29 +873,24 @@ app.get('/health', (req, res) => {
         status: 'ok', 
         timestamp: new Date().toISOString(),
         isLoggedIn: isLoggedIn,
-        browserStatus: browser ? 'running' : 'stopped',
-        contextStatus: context ? 'active' : 'closed',
+        browserStatus: browserManager.browser ? 'running' : 'stopped',
+        contextStatus: browserManager.context ? 'active' : 'closed',
         lastActivity: new Date(lastActivityTime).toISOString(),
-        storage: USE_CLOUDFLARE_KV ? 'Cloudflare KV' : 'Local File',
+        storage: USE_CLOUDFLARE_KV ? 'Cloudflare KV (云端双写)' : 'Local File (本地暂存)',
         queue: queueStatus,
         memory: {
             heapUsed: `${Math.round(memUsage.heapUsed / 1024 / 1024)}MB`,
             heapTotal: `${Math.round(memUsage.heapTotal / 1024 / 1024)}MB`,
-            rss: `${Math.round(memUsage.rss / 1024 / 1024)}MB`,
-            external: `${Math.round(memUsage.external / 1024 / 1024)}MB`
+            rss: `${Math.round(memUsage.rss / 1024 / 1024)}MB`
         },
         gc: {
             available: typeof global.gc === 'function'
         }
     };
     
-    // 同时在日志中输出
-    logMemoryUsage('健康检查');
-    
     res.json(healthInfo);
 });
 
-// 添加测试端点用于验证内存监控
 app.get('/api/test-memory', authenticateToken, (req, res) => {
     logWithFlush('[测试] 手动触发内存监控和GC测试');
     logMemoryUsage('测试 - GC前');
@@ -825,19 +913,39 @@ app.use((err, req, res, next) => {
     res.status(500).json({ error: '服务器内部错误' });
 });
 
-// ========================= 优雅关闭 =========================
+// ========================= 启动与优雅关闭 =========================
+// 服务启动预热恢复会话（解决 Render 冷启动后登录状态重置为 false 的问题）
+async function warmUpSession() {
+    logWithFlush('[启动预热] 正在从持久化存储恢复会话...');
+    try {
+        const sessionData = await loadSession();
+        if (sessionData) {
+            await initBrowser();
+            const status = await checkLoginStatus();
+            logWithFlush(`[启动预热] 会话恢复完成: ${status ? '✅ 成功恢复登录态' : '❌ 会话已失效，需要重新扫码'}`);
+        } else {
+            logWithFlush('[启动预热] 未检测到持久化会话记录');
+        }
+    } catch (err) {
+        logErrorWithFlush('[启动预热] 恢复异常:', err.message);
+    }
+}
+
 async function gracefulShutdown(signal) {
-    logWithFlush(`[关闭] 收到 ${signal} 信号`);
+    logWithFlush(`[关闭] 收到 ${signal} 信号（Render 可能正在休眠或重新部署）`);
     
-    // 等待队列清空（最多等待30秒）
-    const maxWait = 30000;
+    const maxWait = 10000;
     const startTime = Date.now();
     while (requestQueue.processing && (Date.now() - startTime) < maxWait) {
         logWithFlush(`[关闭] 等待队列完成: ${requestQueue.getStatus().currentOperation}`);
-        await new Promise(resolve => setTimeout(resolve, 1000));
+        await new Promise(resolve => setTimeout(resolve, 500));
     }
     
     try {
+        if (isLoggedIn) {
+            logWithFlush('[关闭] 正在同步保存最新会话至持久化存储...');
+            await browserManager.saveSessionNow();
+        }
         await browserManager.cleanup(true);
         logWithFlush('[关闭] 资源清理完成');
     } catch (error) {
@@ -853,31 +961,23 @@ process.on('unhandledRejection', (reason) => {
     logErrorWithFlush('[Promise拒绝]:', reason);
 });
 
-app.listen(PORT, () => {
+// 监听 0.0.0.0 以适配 Render 容器网络环境
+app.listen(PORT, '0.0.0.0', () => {
     logWithFlush(`[启动] 🚀 服务器运行在端口 ${PORT}`);
-    logWithFlush(`[启动] 🌐 访问: http://localhost:${PORT}`);
-    logWithFlush(`[启动] ❤️ 健康检查: http://localhost:${PORT}/health`);
+    logWithFlush(`[启动] 🌐 访问地址: http://0.0.0.0:${PORT}`);
+    logWithFlush(`[启动] ❤️ 健康检查: http://0.0.0.0:${PORT}/health`);
     logWithFlush(`[启动] 🔄 请求队列已启用，自动处理并发冲突`);
-    logWithFlush(`[启动] 💾 内存优化模式：空闲2分钟后自动关闭浏览器`);
+    logWithFlush(`[启动] 💾 Render 低内存优化模式：空闲2分钟后自动释放浏览器`);
     
-    // 显示存储模式
     if (USE_CLOUDFLARE_KV) {
-        logWithFlush(`[启动] ☁️ 会话存储: Cloudflare KV (云端持久化)`);
+        logWithFlush(`[启动] ☁️ 会话存储: Cloudflare KV (云端双写持久化，适配 Render 免费版)`);
     } else {
-        logWithFlush(`[启动] 📁 会话存储: 本地文件 (容器重启后丢失)`);
-        logWithFlush(`[启动] ⚠️ 提示: 配置 Cloudflare KV 环境变量以启用云端持久化`);
+        logWithFlush(`[启动] 📁 会话存储: 本地文件 (⚠️ 警告: Render 免费版重启后将丢失，请在 Render 后台配置 Cloudflare KV)`);
     }
     
-    // 检查 GC 是否可用
     const gcAvailable = typeof global.gc === 'function';
-    logWithFlush(`[启动] 🧹 垃圾回收 GC: ${gcAvailable ? '✅ 已启用 (每次操作后自动清理)' : '❌ 未启用 (需要 --expose-gc 参数)'}`);
+    logWithFlush(`[启动] 🧹 垃圾回收 GC: ${gcAvailable ? '✅ 已启用' : '❌ 未启用 (需要 --expose-gc 参数)'}`);
     
-    if (!gcAvailable) {
-        logWithFlush(`[启动] ⚠️ 提示: 请在启动命令中添加 --expose-gc 参数以启用手动垃圾回收`);
-    }
-    
-    // 启动时记录初始内存状态
-    setTimeout(() => {
-        logMemoryUsage('启动完成');
-    }, 1000);
+    // 异步执行启动预热，不阻塞端口监听
+    warmUpSession();
 });
