@@ -405,7 +405,7 @@ class BrowserManager {
         }
     }
 
-    async saveSessionNow() {
+    async saveSessionNow(forceCloudflare = false) {
         if (!this.context) return false;
         try {
             const sessionData = await this.context.storageState();
@@ -413,7 +413,7 @@ class BrowserManager {
                 return false;
             }
 
-            // 1. 优先保证本地文件写入（快速持久化）
+            // 1. 优先保证本地文件写入（快速持久化，无配额限制）
             try {
                 await fs.ensureDir(DATA_DIR);
                 await fs.writeJson(SESSION_FILE, sessionData);
@@ -422,9 +422,22 @@ class BrowserManager {
                 logErrorWithFlush('[会话] 本地文件写入警告:', fsErr.message);
             }
             
-            // 2. 双写备份到 Cloudflare KV（适配 Render 免费版 Ephemeral 存储无盘特性）
+            // 2. Cloudflare KV 节流同步（非关键操作每小时最多同步1次，防配额耗尽）
             if (USE_CLOUDFLARE_KV) {
-                await saveSessionToCloudflare(sessionData);
+                const now = Date.now();
+                const timeSinceLastSync = now - lastKvSyncTime;
+
+                if (forceCloudflare || timeSinceLastSync >= KV_MIN_SYNC_INTERVAL) {
+                    const reason = forceCloudflare ? '关键操作强制同步' : `周期续期同步 (距上次 ${Math.round(timeSinceLastSync / 60000)} 分钟)`;
+                    logWithFlush(`[Cloudflare KV] 准备写入云端 (${reason})...`);
+                    const success = await saveSessionToCloudflare(sessionData);
+                    if (success) {
+                        lastKvSyncTime = now;
+                    }
+                } else {
+                    const remainingMin = Math.round((KV_MIN_SYNC_INTERVAL - timeSinceLastSync) / 60000);
+                    logWithFlush(`[Cloudflare KV] ⏳ 触发节流保护：距上次同步不足 1 小时 (还剩 ${remainingMin} 分钟)，跳过本次云端写入`);
+                }
             }
             return true;
         } catch (error) {
@@ -471,6 +484,10 @@ let loginPage = null;
 let isLoggedIn = false;
 let lastActivityTime = Date.now();
 
+// Cloudflare KV 同步节流控制：限制非关键操作同步频率（默认 1 小时）
+let lastKvSyncTime = 0;
+const KV_MIN_SYNC_INTERVAL = 60 * 60 * 1000;
+
 // ========================= 核心功能函数 =========================
 async function initBrowser() {
     const { browser: br, context: ctx } = await browserManager.init();
@@ -484,6 +501,7 @@ async function loadSession() {
         if (USE_CLOUDFLARE_KV) {
             const sessionData = await loadSessionFromCloudflare();
             if (sessionData && sessionData.cookies && sessionData.cookies.length > 0) {
+                lastKvSyncTime = Date.now(); // 记录本次从云端拉取时间
                 await fs.writeJson(SESSION_FILE, sessionData).catch(() => {});
                 return sessionData;
             }
@@ -670,7 +688,7 @@ async function checkScanStatus() {
 
             // 等待 1 秒确保所有关联 Cookie 写入完毕
             await loginPage.waitForTimeout(1000).catch(() => {});
-            await browserManager.saveSessionNow();
+            await browserManager.saveSessionNow(true); // 扫码登录为关键操作，强制同步云端
             
             await loginPage.close().catch(() => {});
             loginPage = null;
@@ -752,7 +770,7 @@ async function postWeibo(content) {
             if (result.ok === 1) {
                 lastActivityTime = Date.now();
                 logWithFlush('[发送微博] ✅ 发送成功!');
-                await browserManager.saveSessionNow();
+                await browserManager.saveSessionNow(true); // 发送微博成功为关键操作，强制同步云端
                 return {
                     success: true, 
                     message: '微博发送成功',
@@ -943,8 +961,8 @@ async function gracefulShutdown(signal) {
     
     try {
         if (isLoggedIn) {
-            logWithFlush('[关闭] 正在同步保存最新会话至持久化存储...');
-            await browserManager.saveSessionNow();
+            logWithFlush('[关闭] 正在同步保存最新会话至持久化存储 (关键操作强制同步)...');
+            await browserManager.saveSessionNow(true);
         }
         await browserManager.cleanup(true);
         logWithFlush('[关闭] 资源清理完成');
